@@ -814,6 +814,19 @@ body{font-family:'Inter',sans-serif;background:var(--navy-deep);color:var(--text
         </div>
         <div id="networthBreakdown" style="position:relative"></div>
       </div>
+      <div id="propertyNetWorthCard" style="display:none;background:linear-gradient(135deg,rgba(212,175,55,0.12),rgba(212,175,55,0.04));border:1px solid rgba(212,175,55,0.25);border-radius:14px;padding:16px;margin-bottom:20px">
+        <details>
+          <summary style="cursor:pointer;list-style:none;display:flex;justify-content:space-between;align-items:center">
+            <div>
+              <div style="font-size:11px;color:var(--gold);letter-spacing:1px;font-weight:600">🏘️ PROPERTY NET WORTH</div>
+              <div style="font-size:24px;font-weight:700;color:var(--text-primary);font-family:'Fraunces',Georgia,serif;margin-top:4px" id="propertyTotalEquity">$0</div>
+              <div style="font-size:11px;color:var(--text-muted);margin-top:2px"><span id="propertyTotalValue">$0</span> value − <span id="propertyTotalDebt">$0</span> debt</div>
+            </div>
+            <div style="color:var(--gold);font-size:20px">▾</div>
+          </summary>
+          <div id="propertyBreakdownList" style="margin-top:16px;border-top:1px solid var(--border-soft);padding-top:12px"></div>
+        </details>
+      </div>
       <div class="ai-card" id="aiInsightCard" style="display:none">
         <div class="ai-badge">AI Daily Brief</div>
         <div class="ai-text" id="aiInsightText"></div>
@@ -1135,10 +1148,9 @@ body{font-family:'Inter',sans-serif;background:var(--navy-deep);color:var(--text
     </div>
     
     <div class="input-group" id="linkedLoanGroup" style="display:none">
-      <label class="input-label">🔗 Linked Loan / Mortgage <span style="font-size:10px;color:var(--text-muted);font-weight:normal">— for real estate, tag the loan against this property (for net worth calc)</span></label>
-      <select class="input" id="manualLinkedLoan" style="font-size:13px">
-        <option value="">— No linked loan —</option>
-      </select>
+      <label class="input-label">🔗 Loan Allocations <span style="font-size:10px;color:var(--text-muted);font-weight:normal">— tag multiple loans/portions to this property</span></label>
+      <div id="loanAllocationsList" style="background:rgba(20,29,49,0.4);border:1px solid var(--border-soft);border-radius:10px;padding:10px;min-height:50px"></div>
+      <button type="button" class="btn btn-ghost" onclick="addLoanAllocationRow()" style="margin-top:8px;font-size:12px;padding:8px;border:1px dashed var(--gold);color:var(--gold)">+ Add Loan Allocation</button>
     </div>
     
     <details style="margin-bottom:16px;background:rgba(212,175,55,0.05);border:1px solid var(--border-soft);border-radius:12px;padding:12px">
@@ -1742,6 +1754,9 @@ function renderDashboard(){
   document.getElementById('netWorthValue').textContent = fmt(netWorth);
   document.getElementById('personalNW').textContent = fmt(personalNW);
   document.getElementById('businessNW').textContent = fmt(businessNW);
+  
+  // Render property-wise net worth breakdown
+  renderPropertyNetWorth();
 
   // Render breakdown card
   renderNetWorthBreakdown(groups, totalAssets, totalLiabilities);
@@ -2195,6 +2210,78 @@ function renderMonthChart(mt){
   });
 }
 
+function renderPropertyNetWorth(){
+  const card = document.getElementById('propertyNetWorthCard');
+  const properties = (state.accounts || []).filter(a => 
+    a.user_type === 'real_estate' || a.subtype === 'real_estate'
+  );
+  
+  if(properties.length === 0){
+    card.style.display = 'none';
+    return;
+  }
+  
+  card.style.display = 'block';
+  
+  let totalValue = 0, totalDebt = 0;
+  const propertyList = [];
+  
+  properties.forEach(p => {
+    const propVal = Math.abs(Number(p.balance || 0));
+    const allocs = Array.isArray(p.loan_allocations) ? p.loan_allocations : [];
+    let propDebt = 0;
+    const debtBreakdown = [];
+    allocs.forEach(x => {
+      const loan = state.accounts.find(l => l.id === x.loan_id);
+      const amt = Number(x.amount || 0);
+      propDebt += amt;
+      if(loan){
+        debtBreakdown.push({ name: loan.name, amount: amt });
+      }
+    });
+    const equity = propVal - propDebt;
+    totalValue += propVal;
+    totalDebt += propDebt;
+    propertyList.push({ name: p.name, owner: p.owner, value: propVal, debt: propDebt, equity, debtBreakdown });
+  });
+  
+  const totalEquity = totalValue - totalDebt;
+  document.getElementById('propertyTotalEquity').textContent = fmt(totalEquity);
+  document.getElementById('propertyTotalValue').textContent = fmt(totalValue);
+  document.getElementById('propertyTotalDebt').textContent = fmt(totalDebt);
+  
+  // Sort by equity descending
+  propertyList.sort((a,b) => b.equity - a.equity);
+  
+  const breakdownDiv = document.getElementById('propertyBreakdownList');
+  breakdownDiv.innerHTML = propertyList.map(p => {
+    const equityColor = p.equity >= 0 ? 'var(--gold)' : 'var(--red)';
+    const ownerBadge = p.owner === 'wife' 
+      ? '<span style="font-size:9px;background:rgba(255,182,193,0.15);color:#ffb6c1;padding:1px 6px;border-radius:4px;margin-left:6px">Wife</span>'
+      : p.owner === 'business'
+      ? '<span style="font-size:9px;background:rgba(100,150,255,0.15);color:#6496ff;padding:1px 6px;border-radius:4px;margin-left:6px">Business</span>'
+      : '';
+    const debtLines = p.debtBreakdown.length 
+      ? p.debtBreakdown.map(d => `<div style="font-size:10px;color:var(--text-muted);margin-left:8px">↳ ${d.name}: ${fmt(-d.amount)}</div>`).join('')
+      : '<div style="font-size:10px;color:var(--text-muted);margin-left:8px">↳ No linked loans</div>';
+    return `
+      <div style="background:rgba(20,29,49,0.4);border-radius:10px;padding:12px;margin-bottom:10px">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px">
+          <div style="flex:1">
+            <div style="font-size:14px;font-weight:600;color:var(--text-primary)">🏘️ ${p.name}${ownerBadge}</div>
+            <div style="font-size:11px;color:var(--text-muted);margin-top:2px">Value: ${fmt(p.value)}</div>
+            ${debtLines}
+          </div>
+          <div style="text-align:right">
+            <div style="font-size:10px;color:var(--text-muted)">EQUITY</div>
+            <div style="font-size:18px;font-weight:700;color:${equityColor};font-family:'Fraunces',Georgia,serif">${fmt(p.equity)}</div>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
 function renderAccounts(){
   const list = document.getElementById('accountsList');
   document.getElementById('accountCount').textContent = state.accounts.length + ' linked';
@@ -2238,16 +2325,26 @@ function renderAccounts(){
       const initial = (dispInst || dispName).charAt(0);
       const ob = a.owner === 'wife' ? '<span class="account-owner wife">Wife</span>' : (a.owner === 'business' ? '<span class="account-owner">Business</span>' : '');
       const manualBadge = a.is_manual ? '<span style="font-size:9px;color:var(--gold);background:rgba(212,175,55,0.15);padding:2px 6px;border-radius:4px;margin-left:4px;font-weight:600">MANUAL</span>' : '';
-      // Real estate equity calculation if linked loan present
+      // Real estate equity calculation if allocations present
       let equityLine = '';
-      if((a.user_type === 'real_estate' || a.subtype === 'real_estate') && a.linked_loan_id){
-        const linkedLoan = state.accounts.find(x => x.id === a.linked_loan_id);
-        if(linkedLoan){
+      if((a.user_type === 'real_estate' || a.subtype === 'real_estate')){
+        const allocs = Array.isArray(a.loan_allocations) ? a.loan_allocations : [];
+        if(allocs.length > 0){
           const propVal = Math.abs(Number(a.balance || 0));
-          const loanBal = Math.abs(Number(linkedLoan.balance || 0));
-          const equity = propVal - loanBal;
+          let totalAllocated = 0;
+          const allocLines = [];
+          allocs.forEach(x => {
+            const loan = state.accounts.find(l => l.id === x.loan_id);
+            const amt = Number(x.amount || 0);
+            totalAllocated += amt;
+            if(loan){
+              allocLines.push(`🔗 ${loan.name}: ${fmt(-amt)}`);
+            }
+          });
+          const equity = propVal - totalAllocated;
           const equityColor = equity >= 0 ? 'var(--gold)' : 'var(--red)';
-          equityLine = `<div style="font-size:10px;color:${equityColor};margin-top:2px;font-weight:600">🔗 ${linkedLoan.name}: ${fmt(-loanBal)} • Equity: ${fmt(equity)}</div>`;
+          equityLine = `<div style="font-size:10px;color:var(--text-secondary);margin-top:2px">${allocLines.join(' • ')}</div>
+            <div style="font-size:10px;color:${equityColor};margin-top:2px;font-weight:600">Equity: ${fmt(equity)}</div>`;
         }
       }
       const item = document.createElement('div');
@@ -2307,33 +2404,99 @@ function onManualTypeChange(){
   const linkedLoanGroup = document.getElementById('linkedLoanGroup');
   if(type === 'real_estate'){
     linkedLoanGroup.style.display = 'block';
-    populateLinkedLoanDropdown();
+    renderLoanAllocations();
   } else {
     linkedLoanGroup.style.display = 'none';
   }
 }
 
-function populateLinkedLoanDropdown(){
-  const select = document.getElementById('manualLinkedLoan');
-  const currentValue = select.value;
-  // Clear and add default
-  select.innerHTML = '<option value="">— No linked loan —</option>';
-  // Find all loan-type accounts (mortgage, heloc, loan, student_loan, auto)
+// Calculate remaining unallocated balance of a loan across ALL properties (excluding current property being edited)
+function getLoanRemainingBalance(loanId, excludePropertyId = null){
+  const loan = state.accounts.find(a => a.id === loanId);
+  if(!loan) return 0;
+  const totalBal = Math.abs(Number(loan.balance || 0));
+  let allocated = 0;
+  (state.accounts || []).forEach(a => {
+    if(a.id === excludePropertyId) return; // skip current property being edited
+    if(!(a.user_type === 'real_estate' || a.subtype === 'real_estate')) return;
+    const allocs = Array.isArray(a.loan_allocations) ? a.loan_allocations : [];
+    allocs.forEach(x => {
+      if(x.loan_id === loanId) allocated += Number(x.amount || 0);
+    });
+  });
+  return Math.max(0, totalBal - allocated);
+}
+
+// state for the modal's allocation editing
+let _editAllocations = []; // array of {loan_id, amount}
+
+function renderLoanAllocations(){
+  const container = document.getElementById('loanAllocationsList');
+  if(!_editAllocations.length){
+    container.innerHTML = '<div style="color:var(--text-muted);font-size:11px;text-align:center;padding:10px">No loans allocated yet. Tap "+ Add Loan Allocation" below.</div>';
+    return;
+  }
+  const currentPropId = state.currentAccount ? state.currentAccount.id : null;
   const loanSubtypes = ['mortgage', 'heloc', 'loan', 'student_loan', 'auto'];
   const loans = (state.accounts || []).filter(a => 
     loanSubtypes.includes(a.user_type || a.subtype) || 
     a.type === 'loan' ||
     (a.subtype && a.subtype.includes('mortgage'))
   );
-  loans.forEach(loan => {
-    const opt = document.createElement('option');
-    opt.value = loan.id;
-    const bal = Math.abs(Number(loan.balance || 0));
-    opt.textContent = `${loan.name} (${loan.institution}) — $${bal.toLocaleString()}`;
-    select.appendChild(opt);
+  
+  container.innerHTML = '';
+  _editAllocations.forEach((alloc, idx) => {
+    const row = document.createElement('div');
+    row.style.cssText = 'background:rgba(212,175,55,0.06);border:1px solid var(--border-soft);border-radius:8px;padding:10px;margin-bottom:8px';
+    
+    // Build loan dropdown showing remaining balance
+    const remaining = alloc.loan_id ? getLoanRemainingBalance(alloc.loan_id, currentPropId) : 0;
+    const currentAllocAmount = Number(alloc.amount || 0);
+    const maxForThisLoan = remaining + currentAllocAmount; // can use what's left + what we already had
+    
+    let loanOptions = '<option value="">— Select a loan —</option>';
+    loans.forEach(l => {
+      const rem = getLoanRemainingBalance(l.id, currentPropId);
+      const ourCurrent = (alloc.loan_id === l.id) ? currentAllocAmount : 0;
+      const available = rem + ourCurrent;
+      const bal = Math.abs(Number(l.balance || 0));
+      const sel = alloc.loan_id === l.id ? 'selected' : '';
+      loanOptions += `<option value="${l.id}" ${sel}>${l.name} — Total: $${bal.toLocaleString()} • Available: $${available.toLocaleString()}</option>`;
+    });
+    
+    row.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <span style="font-size:11px;color:var(--gold);font-weight:600">Allocation #${idx+1}</span>
+        <button type="button" onclick="removeLoanAllocationRow(${idx})" style="background:transparent;border:none;color:var(--red);cursor:pointer;font-size:18px;padding:0 4px">×</button>
+      </div>
+      <select class="input" onchange="updateAllocLoan(${idx}, this.value)" style="font-size:12px;margin-bottom:6px">${loanOptions}</select>
+      <div style="display:flex;align-items:center;gap:8px">
+        <label style="font-size:11px;color:var(--text-muted);white-space:nowrap">Amount:</label>
+        <input type="number" step="0.01" placeholder="e.g., 100000" value="${currentAllocAmount || ''}" onchange="updateAllocAmount(${idx}, this.value)" class="input" style="font-size:12px;flex:1">
+      </div>
+      ${alloc.loan_id ? `<div style="font-size:10px;color:var(--text-muted);margin-top:4px">💡 Max available for this allocation: $${maxForThisLoan.toLocaleString()}</div>` : ''}
+    `;
+    container.appendChild(row);
   });
-  // Restore previous selection if still valid
-  if(currentValue) select.value = currentValue;
+}
+
+function addLoanAllocationRow(){
+  _editAllocations.push({ loan_id: '', amount: 0 });
+  renderLoanAllocations();
+}
+
+function removeLoanAllocationRow(idx){
+  _editAllocations.splice(idx, 1);
+  renderLoanAllocations();
+}
+
+function updateAllocLoan(idx, loanId){
+  _editAllocations[idx].loan_id = loanId;
+  renderLoanAllocations();
+}
+
+function updateAllocAmount(idx, amount){
+  _editAllocations[idx].amount = parseFloat(amount) || 0;
 }
 
 function openManualAccountModal(existingAccount = null){
@@ -2355,9 +2518,10 @@ function openManualAccountModal(existingAccount = null){
     document.getElementById('manualMinPay').value = existingAccount.manual_min_payment || existingAccount.min_payment || '';
     document.getElementById('manualPayUrl').value = existingAccount.pay_url || '';
     document.getElementById('manualNotes').value = existingAccount.notes || '';
-    // Populate linked loan dropdown then set value
-    populateLinkedLoanDropdown();
-    document.getElementById('manualLinkedLoan').value = existingAccount.linked_loan_id || '';
+    // Load existing allocations
+    _editAllocations = Array.isArray(existingAccount.loan_allocations) 
+      ? JSON.parse(JSON.stringify(existingAccount.loan_allocations)) 
+      : [];
     onManualTypeChange();
     deleteBtn.style.display = 'block';
   } else {
@@ -2374,8 +2538,7 @@ function openManualAccountModal(existingAccount = null){
     document.getElementById('manualMinPay').value = '';
     document.getElementById('manualPayUrl').value = '';
     document.getElementById('manualNotes').value = '';
-    populateLinkedLoanDropdown();
-    document.getElementById('manualLinkedLoan').value = '';
+    _editAllocations = [];
     onManualTypeChange();
     deleteBtn.style.display = 'none';
   }
@@ -2399,11 +2562,28 @@ async function saveManualAccount(){
   const minPay = document.getElementById('manualMinPay').value ? parseFloat(document.getElementById('manualMinPay').value) : null;
   const payUrl = document.getElementById('manualPayUrl').value.trim() || null;
   const notes = document.getElementById('manualNotes').value.trim() || null;
-  const linkedLoanId = document.getElementById('manualLinkedLoan').value || null;
   
   if(!name || !institution || isNaN(balanceInput)){
     showToast('Name, Institution, and Balance are required');
     return;
+  }
+  
+  // For real_estate, validate allocations
+  let loanAllocations = [];
+  if(type === 'real_estate'){
+    // Filter out empty rows
+    const validAllocs = _editAllocations.filter(a => a.loan_id && Number(a.amount) > 0);
+    // Validate each allocation doesn't exceed remaining loan balance
+    const currentPropId = state.currentAccount ? state.currentAccount.id : null;
+    for(const a of validAllocs){
+      const remaining = getLoanRemainingBalance(a.loan_id, currentPropId);
+      if(Number(a.amount) > remaining + 0.01){
+        const loan = state.accounts.find(l => l.id === a.loan_id);
+        showToast(`Allocation for "${loan?.name || 'loan'}" ($${Number(a.amount).toLocaleString()}) exceeds available ($${remaining.toLocaleString()})`);
+        return;
+      }
+    }
+    loanAllocations = validAllocs;
   }
   
   // Determine if liability or asset based on type
@@ -2440,7 +2620,8 @@ async function saveManualAccount(){
       manual_min_payment: minPay,
       pay_url: payUrl,
       notes: notes,
-      linked_loan_id: type === 'real_estate' ? linkedLoanId : null,
+      loan_allocations: type === 'real_estate' ? loanAllocations : [],
+      linked_loan_id: null,  // deprecated, kept null for backward compat
       item_id: null  // No Plaid item
     };
     
