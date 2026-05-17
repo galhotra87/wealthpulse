@@ -1,0 +1,3363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<!-- Prevent caching of stale data -->
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>WealthPulse — Personal Finance Command Center</title>
+
+<!--
+
+================================================================================
+                          WEALTHPULSE - SETUP GUIDE
+================================================================================
+
+YE EK HI FILE HAI. BAS ISE CLOUDFLARE PAGES PE DEPLOY KARO. BAS.
+
+================================================================================
+STEP 0: DEMO MODE (ABHI HI TRY KARO - 0 SETUP)
+================================================================================
+
+1. Is file ko browser me kholo (ya Cloudflare Pages pe deploy karo)
+2. Login screen pe "Explore Demo" tap karo
+3. Sample data se poora app dekho
+
+Real data ke liye neeche ke steps follow karo.
+
+================================================================================
+STEP 1: SUPABASE ACCOUNT (5 MIN)
+================================================================================
+
+1. https://supabase.com khol ke "Start your project" -> sign in with GitHub
+2. "New Project" click karo
+   - Name: wealthpulse
+   - Database password: koi strong password (note kar lo)
+   - Region: closest to you (East US)
+   - Pricing: Free
+3. ~2 min wait karo project create hone ka
+4. Project dashboard pe Settings -> API
+   - Copy "Project URL"           -> ye SUPABASE_URL hai
+   - Copy "anon public" key       -> ye SUPABASE_ANON_KEY hai
+   - Copy "service_role" key      -> ye baad me Edge Functions me chahiye (secret rakho)
+5. Niche CONFIG section me ye dono values paste karo
+
+================================================================================
+STEP 2: DATABASE TABLES BANAO (3 MIN)
+================================================================================
+
+Supabase dashboard me LEFT sidebar -> "SQL Editor" -> "New query"
+Niche wala POORA SQL copy-paste karo -> "Run" button dabao:
+
+------ SQL START (copy from here) ------
+
+-- Profile extension
+CREATE TABLE IF NOT EXISTS profiles (
+  id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  full_name text,
+  created_at timestamptz DEFAULT now()
+);
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "own profile" ON profiles FOR ALL USING (auth.uid() = id);
+
+-- Plaid items (one per linked bank)
+CREATE TABLE IF NOT EXISTS plaid_items (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  plaid_item_id text UNIQUE NOT NULL,
+  plaid_access_token text NOT NULL,
+  institution_id text,
+  institution_name text,
+  cursor text,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+ALTER TABLE plaid_items ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "own items" ON plaid_items FOR ALL USING (auth.uid() = user_id);
+
+-- Accounts
+CREATE TABLE IF NOT EXISTS accounts (
+  id text PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  item_id uuid REFERENCES plaid_items(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  institution text,
+  type text,
+  subtype text,
+  balance numeric DEFAULT 0,
+  available numeric,
+  owner text DEFAULT 'self',
+  due_date date,
+  due_amount numeric,
+  min_payment numeric,
+  pay_url text,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_acc_user ON accounts(user_id);
+ALTER TABLE accounts ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "own accounts" ON accounts FOR ALL USING (auth.uid() = user_id);
+
+-- Transactions
+CREATE TABLE IF NOT EXISTS transactions (
+  id text PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  account_id text NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  date date NOT NULL,
+  amount numeric NOT NULL,
+  description text NOT NULL,
+  merchant text,
+  plaid_category text[],
+  category text DEFAULT 'Other',
+  tx_type text DEFAULT 'uncategorized',
+  owner text DEFAULT 'self',
+  notes text,
+  pending boolean DEFAULT false,
+  excluded boolean DEFAULT false,
+  created_at timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_tx_user_date ON transactions(user_id, date DESC);
+ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "own transactions" ON transactions FOR ALL USING (auth.uid() = user_id);
+
+-- Categorization rules (auto-tag future transactions)
+CREATE TABLE IF NOT EXISTS category_rules (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  match_text text NOT NULL,
+  set_category text,
+  set_type text,
+  set_owner text,
+  priority int DEFAULT 0,
+  created_at timestamptz DEFAULT now()
+);
+ALTER TABLE category_rules ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "own rules" ON category_rules FOR ALL USING (auth.uid() = user_id);
+
+-- Auto-create profile on signup
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS trigger AS $$
+BEGIN
+  INSERT INTO public.profiles (id, full_name)
+  VALUES (new.id, COALESCE(new.raw_user_meta_data->>'full_name', new.email));
+  RETURN new;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+------ SQL END (copy till here) ------
+
+Run hone ke baad "Success. No rows returned" message aana chahiye.
+
+
+================================================================================
+STEP 3: PLAID ACCOUNT (5 MIN)
+================================================================================
+
+1. https://dashboard.plaid.com/signup khol ke account banao (free)
+2. Email verify karo
+3. Dashboard pe Team Settings -> Keys
+   - Copy "client_id"
+   - Copy "Sandbox" secret (testing ke liye)
+4. Niche CONFIG section me PLAID_CLIENT_ID paste karo
+
+NOTE: Sandbox = fake test banks (free, unlimited).
+      Development = real banks tak 100 accounts free.
+      Production = paid (~$0.30/account/month).
+
+Pehle Sandbox me test karo. Real bank link karne ke liye baad me
+Plaid dashboard pe "Request Development Access" karna (free, 1-2 din me approval).
+
+
+================================================================================
+STEP 4: EDGE FUNCTIONS DEPLOY (10 MIN)
+================================================================================
+
+Edge Functions = backend code jo Plaid se baat karta hai (secrets safe rakhne ke liye).
+
+OPTION A: SUPABASE DASHBOARD (Recommended - no terminal needed)
+-----------------------------------------------------------------
+1. Supabase dashboard -> LEFT sidebar -> "Edge Functions"
+2. "Deploy a new function" click karo
+3. Function name: "plaid-link-token"
+4. Niche LINK-TOKEN CODE copy-paste karo -> Deploy
+5. Same way 3 more functions banao:
+   - "plaid-exchange-token" (EXCHANGE CODE)
+   - "plaid-sync"           (SYNC CODE)
+   - "daily-report"         (REPORT CODE)
+6. Edge Functions ke "Secrets" tab me ye add karo:
+   - PLAID_CLIENT_ID    = (Step 3 ka client id)
+   - PLAID_SECRET       = (Step 3 ka sandbox secret)
+   - PLAID_ENV          = sandbox
+   - GEMINI_API_KEY     = (optional, AI brief ke liye)
+   - RESEND_API_KEY     = (optional, email ke liye)
+
+OPTION B: SUPABASE CLI (advanced)
+---------------------------------
+  npm install -g supabase
+  supabase login
+  supabase link --project-ref YOUR_PROJECT_REF
+  supabase functions deploy plaid-link-token
+  ...etc
+
+
+--- LINK-TOKEN CODE (function name: plaid-link-token) ---
+
+import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
+const PLAID_URL = `https://${Deno.env.get('PLAID_ENV') || 'sandbox'}.plaid.com`
+const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type' }
+
+serve(async (req) => {
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: cors })
+  const { user_id } = await req.json()
+  const res = await fetch(`${PLAID_URL}/link/token/create`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      client_id: Deno.env.get('PLAID_CLIENT_ID'),
+      secret: Deno.env.get('PLAID_SECRET'),
+      user: { client_user_id: user_id },
+      client_name: 'WealthPulse',
+      products: ['transactions', 'liabilities'],
+      country_codes: ['US'],
+      language: 'en',
+    }),
+  })
+  const data = await res.json()
+  return new Response(JSON.stringify(data), { headers: { ...cors, 'Content-Type': 'application/json' } })
+})
+
+
+--- EXCHANGE CODE (function name: plaid-exchange-token) ---
+
+import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+const PLAID_URL = `https://${Deno.env.get('PLAID_ENV') || 'sandbox'}.plaid.com`
+const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type' }
+
+serve(async (req) => {
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: cors })
+  const { public_token, user_id, metadata } = await req.json()
+  const sb = createClient(Deno.env.get('SUPABASE_URL'), Deno.env.get('SUPABASE_SERVICE_ROLE_KEY'))
+
+  const ex = await fetch(`${PLAID_URL}/item/public_token/exchange`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ client_id: Deno.env.get('PLAID_CLIENT_ID'), secret: Deno.env.get('PLAID_SECRET'), public_token }),
+  })
+  const { access_token, item_id } = await ex.json()
+
+  const { data: item } = await sb.from('plaid_items').insert({
+    user_id, plaid_item_id: item_id, plaid_access_token: access_token,
+    institution_id: metadata?.institution?.institution_id,
+    institution_name: metadata?.institution?.name,
+  }).select().single()
+
+  const ar = await fetch(`${PLAID_URL}/accounts/get`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ client_id: Deno.env.get('PLAID_CLIENT_ID'), secret: Deno.env.get('PLAID_SECRET'), access_token }),
+  })
+  const { accounts } = await ar.json()
+
+  let liabilities = null
+  try {
+    const lr = await fetch(`${PLAID_URL}/liabilities/get`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: Deno.env.get('PLAID_CLIENT_ID'), secret: Deno.env.get('PLAID_SECRET'), access_token }),
+    })
+    liabilities = (await lr.json()).liabilities
+  } catch (e) {}
+
+  for (const a of accounts) {
+    const ci = liabilities?.credit?.find((c) => c.account_id === a.account_id)
+    await sb.from('accounts').upsert({
+      id: a.account_id, user_id, item_id: item.id,
+      name: a.name, institution: metadata?.institution?.name,
+      type: a.type, subtype: a.subtype,
+      balance: a.balances.current, available: a.balances.available,
+      due_date: ci?.next_payment_due_date,
+      due_amount: ci?.last_statement_balance,
+      min_payment: ci?.minimum_payment_amount,
+    })
+  }
+  return new Response(JSON.stringify({ success: true, count: accounts.length }), { headers: { ...cors, 'Content-Type': 'application/json' } })
+})
+
+
+--- SYNC CODE (function name: plaid-sync) ---
+
+import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+const PLAID_URL = `https://${Deno.env.get('PLAID_ENV') || 'sandbox'}.plaid.com`
+const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type' }
+
+function mapCat(cats) {
+  if (!cats?.length) return 'Other'
+  const p = cats[0]?.toLowerCase() || ''
+  const all = cats.join(' ').toLowerCase()
+  if (p.includes('food') || p.includes('restaurant')) return 'Food & Dining'
+  if (p.includes('transport') || p.includes('travel')) return 'Transportation'
+  if (p.includes('shop')) return 'Shopping'
+  if (all.includes('rent')) return 'Rent / Mortgage'
+  if (all.includes('util')) return 'Utilities'
+  if (p.includes('healthcare') || p.includes('medical')) return 'Healthcare'
+  if (p.includes('entertainment') || p.includes('recreation')) return 'Entertainment'
+  if (p.includes('payroll') || all.includes('deposit')) return 'Income / Salary'
+  return 'Other'
+}
+
+serve(async (req) => {
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: cors })
+  const { user_id } = await req.json()
+  const sb = createClient(Deno.env.get('SUPABASE_URL'), Deno.env.get('SUPABASE_SERVICE_ROLE_KEY'))
+  const { data: items } = await sb.from('plaid_items').select('*').eq('user_id', user_id)
+  let added = 0, modified = 0, removed = 0
+
+  for (const item of items || []) {
+    let hasMore = true, cursor = item.cursor
+    const { data: rules } = await sb.from('category_rules').select('*').eq('user_id', user_id).order('priority', { ascending: false })
+
+    while (hasMore) {
+      const sr = await fetch(`${PLAID_URL}/transactions/sync`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ client_id: Deno.env.get('PLAID_CLIENT_ID'), secret: Deno.env.get('PLAID_SECRET'), access_token: item.plaid_access_token, cursor: cursor || undefined }),
+      })
+      const sync = await sr.json()
+      if (sync.error) throw new Error(sync.error_message || sync.error)
+
+      for (const tx of sync.added || []) {
+        const amount = -tx.amount
+        let category = mapCat(tx.category || [])
+        let tx_type = amount > 0 ? 'income' : 'uncategorized'
+        let owner = 'self'
+        for (const r of rules || []) {
+          if ((tx.name || '').toLowerCase().includes(r.match_text.toLowerCase())) {
+            if (r.set_category) category = r.set_category
+            if (r.set_type) tx_type = r.set_type
+            if (r.set_owner) owner = r.set_owner
+            break
+          }
+        }
+        await sb.from('transactions').upsert({
+          id: tx.transaction_id, user_id, account_id: tx.account_id,
+          date: tx.date, amount, description: tx.name, merchant: tx.merchant_name,
+          plaid_category: tx.category || [], category, tx_type, owner, pending: tx.pending,
+        })
+        added++
+      }
+      for (const tx of sync.modified || []) {
+        await sb.from('transactions').update({ amount: -tx.amount, description: tx.name, pending: tx.pending }).eq('id', tx.transaction_id)
+        modified++
+      }
+      for (const tx of sync.removed || []) {
+        await sb.from('transactions').delete().eq('id', tx.transaction_id)
+        removed++
+      }
+      cursor = sync.next_cursor
+      hasMore = sync.has_more
+    }
+    await sb.from('plaid_items').update({ cursor }).eq('id', item.id)
+
+    // Refresh balances
+    const ar = await fetch(`${PLAID_URL}/accounts/get`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: Deno.env.get('PLAID_CLIENT_ID'), secret: Deno.env.get('PLAID_SECRET'), access_token: item.plaid_access_token }),
+    })
+    const { accounts } = await ar.json()
+    let liab = null
+    try {
+      const lr = await fetch(`${PLAID_URL}/liabilities/get`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ client_id: Deno.env.get('PLAID_CLIENT_ID'), secret: Deno.env.get('PLAID_SECRET'), access_token: item.plaid_access_token }),
+      })
+      liab = (await lr.json()).liabilities
+    } catch (e) {}
+    for (const a of accounts) {
+      const ci = liab?.credit?.find((c) => c.account_id === a.account_id)
+      await sb.from('accounts').update({
+        balance: a.balances.current, available: a.balances.available,
+        due_date: ci?.next_payment_due_date, due_amount: ci?.last_statement_balance, min_payment: ci?.minimum_payment_amount,
+      }).eq('id', a.account_id)
+    }
+  }
+  return new Response(JSON.stringify({ success: true, added, modified, removed }), { headers: { ...cors, 'Content-Type': 'application/json' } })
+})
+
+
+--- REPORT CODE (function name: daily-report) ---
+
+import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type' }
+
+async function aiSummary(d) {
+  const key = Deno.env.get('GEMINI_API_KEY')
+  if (!key) return `Yesterday: spent $${d.spent}, received $${d.income}. Top category: ${d.topCat}. ${d.dueCount} cards due this week.`
+  const prompt = `Generate a 2-3 sentence morning finance brief.
+Yesterday spent: $${d.spent}, received: $${d.income}, top category: ${d.topCat}.
+Month-to-date personal net: $${d.monthNet}. Cards due this week: ${d.dueCount}.
+Tone: concise, professional, actionable.`
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+    })
+    const j = await r.json()
+    return j.candidates?.[0]?.content?.parts?.[0]?.text || 'Brief unavailable.'
+  } catch (e) { return 'Brief unavailable.' }
+}
+
+async function sendMail(to, html) {
+  const key = Deno.env.get('RESEND_API_KEY')
+  if (!key) return
+  await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: 'WealthPulse <onboarding@resend.dev>', to, subject: '🌅 Your Daily Financial Brief', html }),
+  })
+}
+
+serve(async (req) => {
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: cors })
+  const sb = createClient(Deno.env.get('SUPABASE_URL'), Deno.env.get('SUPABASE_SERVICE_ROLE_KEY'))
+  const { data: { users } } = await sb.auth.admin.listUsers()
+
+  const y = new Date(); y.setDate(y.getDate() - 1)
+  const yStr = y.toISOString().slice(0, 10)
+  const m = new Date(); m.setDate(1)
+  const mStr = m.toISOString().slice(0, 10)
+
+  for (const u of users || []) {
+    const { data: yT } = await sb.from('transactions').select('*').eq('user_id', u.id).eq('date', yStr)
+    const spent = (yT || []).filter(t => t.amount < 0 && t.tx_type === 'personal').reduce((s, t) => s + Math.abs(t.amount), 0)
+    const income = (yT || []).filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0)
+    const cats = {}
+    ;(yT || []).forEach(t => { if (t.amount < 0) cats[t.category] = (cats[t.category] || 0) + Math.abs(t.amount) })
+    const topCat = Object.entries(cats).sort((a, b) => b[1] - a[1])[0]?.[0] || 'None'
+
+    const { data: mT } = await sb.from('transactions').select('amount').eq('user_id', u.id).gte('date', mStr).eq('tx_type', 'personal')
+    const monthNet = (mT || []).reduce((s, t) => s + Number(t.amount), 0)
+
+    const ow = new Date(); ow.setDate(ow.getDate() + 7)
+    const { data: due } = await sb.from('accounts').select('*').eq('user_id', u.id).eq('type', 'credit').lte('due_date', ow.toISOString().slice(0, 10))
+
+    const summary = await aiSummary({ spent: spent.toFixed(2), income: income.toFixed(2), topCat, monthNet: monthNet.toFixed(2), dueCount: due?.length || 0 })
+
+    if (u.email) {
+      const html = `<div style="font-family:Inter,sans-serif;max-width:600px;margin:auto;padding:24px;background:#0a0e27;color:#f5f5f0;border-radius:16px">
+        <h1 style="color:#d4af37;font-family:Georgia,serif">Good morning ☀️</h1>
+        <p style="font-size:15px;line-height:1.6">${summary}</p>
+        <div style="background:#161c43;padding:16px;border-radius:12px;margin-top:20px">
+          <div style="display:flex;justify-content:space-between;margin-bottom:8px"><span style="color:#a8aac5">Spent:</span><strong>$${spent.toFixed(2)}</strong></div>
+          <div style="display:flex;justify-content:space-between;margin-bottom:8px"><span style="color:#a8aac5">Income:</span><strong style="color:#4ade80">$${income.toFixed(2)}</strong></div>
+          <div style="display:flex;justify-content:space-between"><span style="color:#a8aac5">Month net:</span><strong style="color:#d4af37">$${monthNet.toFixed(2)}</strong></div>
+        </div></div>`
+      await sendMail(u.email, html)
+    }
+  }
+  return new Response(JSON.stringify({ ok: true }), { headers: { ...cors, 'Content-Type': 'application/json' } })
+})
+
+
+================================================================================
+STEP 5: SCHEDULE DAILY SYNC + EMAIL (3 MIN)
+================================================================================
+
+Supabase SQL Editor -> New Query -> Run ye:
+
+------ CRON SQL START ------
+
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+CREATE EXTENSION IF NOT EXISTS pg_net;
+
+-- Replace YOUR_PROJECT and YOUR_SERVICE_ROLE_KEY below
+-- Project URL aur service_role key Settings -> API se milegi
+
+SELECT cron.schedule('plaid-sync-daily', '0 11 * * *', $$
+  SELECT net.http_post(
+    url := 'https://YOUR_PROJECT.supabase.co/functions/v1/plaid-sync',
+    headers := jsonb_build_object('Authorization', 'Bearer YOUR_SERVICE_ROLE_KEY', 'Content-Type', 'application/json'),
+    body := jsonb_build_object()
+  );
+$$);
+
+SELECT cron.schedule('daily-brief', '0 12 * * *', $$
+  SELECT net.http_post(
+    url := 'https://YOUR_PROJECT.supabase.co/functions/v1/daily-report',
+    headers := jsonb_build_object('Authorization', 'Bearer YOUR_SERVICE_ROLE_KEY', 'Content-Type', 'application/json'),
+    body := jsonb_build_object()
+  );
+$$);
+
+------ CRON SQL END ------
+
+NOTE: Times are UTC. 11 UTC = 6 AM EST. 12 UTC = 7 AM EST.
+
+
+================================================================================
+STEP 6: DEPLOY KARO (2 MIN)
+================================================================================
+
+Cloudflare Pages me drag-and-drop method:
+1. https://dash.cloudflare.com -> Workers & Pages -> Create -> Pages
+2. "Upload assets" -> is index.html file ko drag karo
+3. Project name dalo (e.g., "wealthpulse")
+4. URL milegi like: wealthpulse.pages.dev
+
+
+================================================================================
+TEST KAISE KARE (Plaid Sandbox)
+================================================================================
+
+App khol ke account banao (signup karo), phir:
+1. Accounts tab -> "Link New Account"
+2. Koi bhi bank choose karo
+3. Login screen pe ye dalo:
+   Username: user_good
+   Password: pass_good
+   (MFA code agar ho: 1234)
+4. Fake accounts + transactions tumhe milengi
+
+Real bank link karne ke liye Plaid dashboard pe "Request Development Access"
+karna padega (free, 1-2 din me approval mil jata hai).
+
+
+================================================================================
+WIFE KE ACCOUNTS TAG KARNA
+================================================================================
+
+Jab wife ka bank link kar lo, Supabase SQL Editor me:
+
+  UPDATE accounts SET owner = 'wife' WHERE name LIKE '%Discover%';
+  UPDATE accounts SET owner = 'wife' WHERE name LIKE '%Wells Fargo%';
+
+Business accounts ke liye:
+
+  UPDATE accounts SET owner = 'business' WHERE name LIKE '%PennIndus%';
+
+
+================================================================================
+AUTO-CATEGORIZATION RULES (BAAD ME ADD KARO)
+================================================================================
+
+Ek baar rule banao, future me sab transactions auto-categorize honge:
+
+  INSERT INTO category_rules (user_id, match_text, set_category, set_type, set_owner, priority) VALUES
+  (auth.uid(), 'Home Depot', 'Rental Expense', 'business', 'business', 10),
+  (auth.uid(), 'Lowes', 'Rental Expense', 'business', 'business', 10),
+  (auth.uid(), 'Fannie Mae', 'Income / Salary', 'income', 'self', 100),
+  (auth.uid(), 'HOA', 'Rental Expense', 'business', 'business', 10);
+
+
+================================================================================
+COST: $0/month
+================================================================================
+- Supabase: Free tier (500MB DB)
+- Plaid: Free Development (100 accounts)
+- Gemini: Free (1500 requests/day)
+- Cloudflare Pages: Free
+- Resend email: Free (100/day) [optional]
+
+================================================================================
+END OF SETUP GUIDE
+================================================================================
+
+-->
+
+<!-- Plaid Link -->
+<script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+<!-- Supabase -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<!-- Chart.js -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700;9..144,900&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<style>
+:root{
+  --navy-deep:#0a0e27;--navy:#11173a;--navy-light:#1a2150;--navy-card:#161c43;
+  --gold:#d4af37;--gold-bright:#f4cf5f;--gold-soft:rgba(212,175,55,0.12);
+  --text-primary:#f5f5f0;--text-secondary:#a8aac5;--text-muted:#6b6e8a;
+  --green:#4ade80;--green-soft:rgba(74,222,128,0.12);
+  --red:#f87171;--red-soft:rgba(248,113,113,0.12);
+  --amber:#fbbf24;--border:rgba(212,175,55,0.18);--border-soft:rgba(255,255,255,0.06);
+}
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{overflow-x:hidden}
+body{font-family:'Inter',sans-serif;background:var(--navy-deep);color:var(--text-primary);min-height:100vh;-webkit-font-smoothing:antialiased;background-image:radial-gradient(circle at 20% 0%, rgba(212,175,55,0.08) 0%, transparent 40%),radial-gradient(circle at 80% 100%, rgba(26,33,80,0.6) 0%, transparent 50%);}
+.font-display{font-family:'Fraunces',serif;letter-spacing:-0.02em}
+.font-mono{font-family:'JetBrains Mono',monospace}
+
+.auth-screen{min-height:100vh;display:flex;flex-direction:column;justify-content:center;align-items:center;padding:24px;position:relative;}
+.auth-screen::before{content:'';position:absolute;inset:0;background-image:linear-gradient(rgba(212,175,55,0.03) 1px, transparent 1px),linear-gradient(90deg, rgba(212,175,55,0.03) 1px, transparent 1px);background-size:40px 40px;pointer-events:none;}
+.auth-card{width:100%;max-width:380px;background:linear-gradient(145deg, var(--navy-card), var(--navy));border:1px solid var(--border);border-radius:24px;padding:36px 28px;position:relative;z-index:1;box-shadow:0 20px 60px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.05);}
+.brand{text-align:center;margin-bottom:32px;}
+.brand-mark{width:56px;height:56px;margin:0 auto 16px;background:linear-gradient(135deg, var(--gold), var(--gold-bright));border-radius:16px;display:flex;align-items:center;justify-content:center;font-family:'Fraunces',serif;font-weight:900;font-size:28px;color:var(--navy-deep);box-shadow:0 8px 24px rgba(212,175,55,0.3);}
+.brand-name{font-family:'Fraunces',serif;font-size:28px;font-weight:700;color:var(--text-primary);letter-spacing:-0.02em;}
+.brand-tag{font-size:12px;color:var(--gold);letter-spacing:0.18em;text-transform:uppercase;margin-top:4px;font-weight:500;}
+.input-group{margin-bottom:16px}
+.input-label{display:block;font-size:12px;color:var(--text-secondary);margin-bottom:8px;font-weight:500;letter-spacing:0.04em;}
+.input{width:100%;padding:14px 16px;background:rgba(10,14,39,0.6);border:1px solid var(--border-soft);border-radius:12px;color:var(--text-primary);font-size:15px;font-family:inherit;transition:all .2s;}
+.input:focus{outline:none;border-color:var(--gold);background:rgba(10,14,39,0.9)}
+.btn{width:100%;padding:15px;border:none;border-radius:12px;font-family:inherit;font-weight:600;font-size:15px;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px;}
+.btn-primary{background:linear-gradient(135deg, var(--gold), var(--gold-bright));color:var(--navy-deep);box-shadow:0 4px 16px rgba(212,175,55,0.25);}
+.btn-primary:active{transform:scale(0.98)}
+.btn-secondary{background:transparent;color:var(--text-primary);border:1px solid var(--border);}
+.btn-ghost{background:transparent;color:var(--gold);text-decoration:underline;padding:8px;}
+.auth-switch{text-align:center;margin-top:20px;font-size:14px;color:var(--text-secondary);}
+.auth-switch a{color:var(--gold);text-decoration:none;font-weight:500;cursor:pointer}
+
+.app-shell{display:none;padding-bottom:88px}
+.app-shell.active{display:block}
+.header{padding:20px 20px 12px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;background:linear-gradient(180deg, var(--navy-deep) 0%, rgba(10,14,39,0.92) 100%);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);z-index:50;border-bottom:1px solid var(--border-soft);}
+.header-greeting{font-size:13px;color:var(--text-secondary);}
+.header-name{font-family:'Fraunces',serif;font-size:22px;font-weight:700;margin-top:2px;}
+.header-actions{display:flex;gap:8px}
+.icon-btn{width:40px;height:40px;border-radius:12px;background:var(--navy-card);border:1px solid var(--border-soft);display:flex;align-items:center;justify-content:center;color:var(--text-primary);cursor:pointer;}
+.content{padding:20px}
+
+.networth-card{background:linear-gradient(135deg, var(--navy-card), var(--navy-light));border:1px solid var(--border);border-radius:24px;padding:24px;position:relative;overflow:hidden;margin-bottom:20px;}
+.networth-card::before{content:'';position:absolute;top:-50%;right:-30%;width:300px;height:300px;background:radial-gradient(circle, var(--gold-soft) 0%, transparent 70%);pointer-events:none;}
+.networth-label{font-size:11px;color:var(--gold);letter-spacing:0.2em;text-transform:uppercase;font-weight:600;margin-bottom:8px;position:relative;}
+.networth-value{font-family:'Fraunces',serif;font-size:42px;font-weight:700;letter-spacing:-0.03em;position:relative;line-height:1;}
+.networth-change{margin-top:12px;display:flex;align-items:center;gap:8px;position:relative;}
+.change-badge{padding:4px 10px;border-radius:20px;font-size:12px;font-weight:600;font-family:'JetBrains Mono',monospace;}
+.change-up{background:var(--green-soft);color:var(--green)}
+.change-down{background:var(--red-soft);color:var(--red)}
+.change-period{font-size:12px;color:var(--text-muted)}
+.networth-split{margin-top:20px;padding-top:20px;border-top:1px solid var(--border-soft);display:grid;grid-template-columns:1fr 1fr;gap:16px;position:relative;}
+.split-label{font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:4px;}
+.split-value{font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:600;}
+.split-personal .split-value{color:var(--text-primary)}
+.split-business .split-value{color:var(--gold)}
+
+.month-card{background:var(--navy-card);border:1px solid var(--border-soft);border-radius:20px;padding:20px;margin-bottom:20px;}
+.section-header{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:16px;}
+.section-title{font-family:'Fraunces',serif;font-size:20px;font-weight:600;letter-spacing:-0.01em;}
+.section-meta{font-size:12px;color:var(--text-muted);font-family:'JetBrains Mono',monospace;}
+.flow-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;}
+.flow-tile{padding:14px;border-radius:14px;background:rgba(10,14,39,0.5);border:1px solid var(--border-soft);}
+.flow-tile-label{font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:6px;}
+.flow-tile-value{font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:600;}
+.flow-tile.income .flow-tile-value{color:var(--green)}
+.flow-tile.expense .flow-tile-value{color:var(--red)}
+.flow-tile-sub{font-size:11px;color:var(--text-muted);margin-top:4px;font-family:'JetBrains Mono',monospace;}
+.net-strip{background:linear-gradient(90deg, var(--gold-soft), transparent);border-left:3px solid var(--gold);padding:14px 16px;border-radius:8px;display:flex;justify-content:space-between;align-items:center;}
+.net-strip-label{font-size:12px;color:var(--text-secondary);font-weight:500;}
+.net-strip-value{font-family:'Fraunces',serif;font-size:22px;font-weight:700;color:var(--gold);}
+
+.due-card{background:linear-gradient(135deg, rgba(248,113,113,0.08), var(--navy-card));border:1px solid rgba(248,113,113,0.2);border-radius:20px;padding:20px;margin-bottom:20px;}
+.due-list{display:flex;flex-direction:column;gap:12px}
+.due-item{display:flex;justify-content:space-between;align-items:center;padding:14px;background:rgba(10,14,39,0.5);border-radius:14px;border:1px solid var(--border-soft);}
+.due-item-info{flex:1}
+.due-item-name{font-weight:600;font-size:15px;margin-bottom:2px}
+.due-item-meta{font-size:12px;color:var(--text-muted);font-family:'JetBrains Mono',monospace}
+.due-amount{font-family:'JetBrains Mono',monospace;font-weight:600;font-size:16px;}
+.due-days{font-size:11px;margin-top:2px;padding:2px 8px;border-radius:20px;display:inline-block;}
+.due-days.urgent{background:var(--red-soft);color:var(--red)}
+.due-days.soon{background:rgba(251,191,36,0.12);color:var(--amber)}
+.due-days.ok{background:var(--green-soft);color:var(--green)}
+.pay-btn{margin-top:10px;padding:8px 14px;background:var(--gold);color:var(--navy-deep);border:none;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block;}
+
+.accounts-card{background:var(--navy-card);border:1px solid var(--border-soft);border-radius:20px;padding:20px;margin-bottom:20px;}
+.account-item{display:flex;align-items:center;gap:14px;padding:14px 0;border-bottom:1px solid var(--border-soft);}
+.account-item:last-child{border-bottom:none}
+.account-icon{width:40px;height:40px;border-radius:12px;background:var(--gold-soft);display:flex;align-items:center;justify-content:center;font-weight:700;color:var(--gold);font-family:'Fraunces',serif;}
+.account-info{flex:1;min-width:0}
+.account-name{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.account-type{font-size:11px;color:var(--text-muted);margin-top:2px}
+.account-owner{display:inline-block;font-size:10px;padding:1px 6px;border-radius:8px;background:rgba(74,222,128,0.1);color:var(--green);margin-left:6px;}
+.account-owner.wife{background:rgba(244,207,95,0.1);color:var(--gold-bright)}
+.account-balance{font-family:'JetBrains Mono',monospace;font-weight:600;font-size:15px;}
+.add-account-btn{width:100%;margin-top:12px;padding:14px;background:transparent;border:1px dashed var(--border);color:var(--gold);border-radius:14px;font-weight:500;cursor:pointer;font-family:inherit;}
+
+.tx-card{background:var(--navy-card);border:1px solid var(--border-soft);border-radius:20px;padding:20px;margin-bottom:20px;}
+.tx-filters{display:flex;gap:6px;margin-bottom:14px;overflow-x:auto;-ms-overflow-style:none;scrollbar-width:none;}
+.tx-filters::-webkit-scrollbar{display:none}
+.tx-filter{padding:6px 14px;background:rgba(10,14,39,0.5);border:1px solid var(--border-soft);border-radius:20px;font-size:12px;color:var(--text-secondary);white-space:nowrap;cursor:pointer;font-family:inherit;}
+.tx-filter.active{background:var(--gold-soft);color:var(--gold);border-color:var(--gold);}
+.tx-list{display:flex;flex-direction:column}
+.tx-item{display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid var(--border-soft);}
+.tx-item:last-child{border-bottom:none}
+.tx-cat-dot{width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;}
+.tx-info{flex:1;min-width:0}
+.tx-desc{font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.tx-meta{font-size:11px;color:var(--text-muted);margin-top:2px}
+.tx-amount{font-family:'JetBrains Mono',monospace;font-weight:600;font-size:14px;text-align:right;flex-shrink:0;}
+.tx-amount.income{color:var(--green)}
+.tx-amount.expense{color:var(--text-primary)}
+.tx-tag{font-size:9px;padding:1px 6px;border-radius:6px;margin-left:6px;text-transform:uppercase;letter-spacing:0.05em;font-weight:600;}
+.tx-tag.business{background:var(--gold-soft);color:var(--gold)}
+.tx-tag.personal{background:rgba(168,170,197,0.1);color:var(--text-secondary)}
+
+.ai-card{background:linear-gradient(135deg, rgba(212,175,55,0.08), var(--navy-card));border:1px solid var(--border);border-radius:20px;padding:20px;margin-bottom:20px;position:relative;overflow:hidden;}
+.ai-badge{display:inline-flex;align-items:center;gap:6px;font-size:10px;color:var(--gold);letter-spacing:0.15em;text-transform:uppercase;font-weight:600;margin-bottom:10px;}
+.ai-badge::before{content:'✦';font-size:14px;}
+.ai-text{font-size:14px;line-height:1.6;color:var(--text-primary);}
+.ai-text strong{color:var(--gold);font-weight:600}
+
+.bottom-nav{position:fixed;bottom:0;left:0;right:0;background:rgba(10,14,39,0.92);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border-top:1px solid var(--border-soft);padding:10px 12px calc(10px + env(safe-area-inset-bottom));display:flex;justify-content:space-around;z-index:50;}
+.nav-btn{flex:1;background:none;border:none;color:var(--text-muted);padding:8px;font-size:10px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:4px;font-family:inherit;letter-spacing:0.05em;}
+.nav-btn.active{color:var(--gold)}
+.nav-btn svg{width:22px;height:22px}
+
+.view{display:none}
+.view.active{display:block}
+
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.7);backdrop-filter:blur(8px);z-index:100;display:none;align-items:flex-end;justify-content:center;}
+.modal-overlay.active{display:flex}
+.modal{width:100%;max-width:480px;background:var(--navy-card);border-top-left-radius:24px;border-top-right-radius:24px;padding:24px;max-height:85vh;overflow-y:auto;border-top:1px solid var(--border);animation:slideUp .3s ease-out;}
+@keyframes slideUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
+.modal-handle{width:40px;height:4px;background:var(--border);border-radius:2px;margin:0 auto 20px;}
+.modal-title{font-family:'Fraunces',serif;font-size:22px;font-weight:700;margin-bottom:4px;}
+.modal-amount{font-family:'JetBrains Mono',monospace;font-size:32px;font-weight:700;margin:16px 0 24px;}
+.toggle-group{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:20px;}
+.toggle-btn{padding:12px;background:rgba(10,14,39,0.5);border:1px solid var(--border-soft);border-radius:12px;color:var(--text-secondary);font-family:inherit;font-size:13px;font-weight:500;cursor:pointer;}
+.toggle-btn.active{background:var(--gold-soft);border-color:var(--gold);color:var(--gold);}
+.tx-detail-row{display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--border-soft);}
+.tx-detail-label{color:var(--text-muted);font-size:13px}
+.tx-detail-value{font-size:13px;font-weight:500;font-family:'JetBrains Mono',monospace}
+
+.chart-wrap{position:relative;height:180px;margin-top:8px;}
+.loader{display:inline-block;width:16px;height:16px;border:2px solid rgba(255,255,255,0.2);border-top-color:var(--gold);border-radius:50%;animation:spin 0.8s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg)}}
+.empty-state{text-align:center;padding:40px 20px;color:var(--text-muted);}
+.empty-icon{font-size:48px;margin-bottom:12px;opacity:0.5}
+.empty-title{font-size:16px;color:var(--text-secondary);margin-bottom:6px;font-weight:500}
+.empty-sub{font-size:13px}
+.toast{position:fixed;bottom:100px;left:50%;transform:translateX(-50%);background:var(--navy-light);color:var(--text-primary);padding:12px 20px;border-radius:12px;border:1px solid var(--border);font-size:14px;z-index:200;box-shadow:0 8px 24px rgba(0,0,0,0.3);opacity:0;pointer-events:none;transition:opacity .3s;}
+.toast.show{opacity:1}
+.setup-notice{background:linear-gradient(135deg, rgba(251,191,36,0.1), var(--navy-card));border:1px solid rgba(251,191,36,0.3);border-radius:16px;padding:16px;margin-bottom:16px;font-size:13px;color:var(--text-secondary);line-height:1.5;}
+.setup-notice strong{color:var(--amber)}
+.setup-notice code{background:rgba(10,14,39,0.6);padding:2px 6px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--gold);}
+</style>
+</head>
+<body>
+
+<div id="authScreen" class="auth-screen">
+  <div class="auth-card">
+    <div class="brand">
+      <div class="brand-mark">W</div>
+      <div class="brand-name">WealthPulse</div>
+      <div class="brand-tag">Personal Finance Command</div>
+    </div>
+    <div id="loginForm">
+      <div class="input-group">
+        <label class="input-label">Email</label>
+        <input type="email" id="loginEmail" class="input" placeholder="you@email.com" autocomplete="email">
+      </div>
+      <div class="input-group">
+        <label class="input-label">Password</label>
+        <input type="password" id="loginPassword" class="input" placeholder="••••••••" autocomplete="current-password">
+      </div>
+      <button class="btn btn-primary" onclick="handleLogin()"><span id="loginBtnText">Sign In</span></button>
+      <div class="auth-switch">New here? <a onclick="toggleAuth()">Create account</a></div>
+    </div>
+    <div id="signupForm" style="display:none">
+      <div class="input-group"><label class="input-label">Your Name</label><input type="text" id="signupName" class="input" placeholder="Pankaj Galhotra"></div>
+      <div class="input-group"><label class="input-label">Email</label><input type="email" id="signupEmail" class="input" placeholder="you@email.com"></div>
+      <div class="input-group"><label class="input-label">Password</label><input type="password" id="signupPassword" class="input" placeholder="Min 8 characters"></div>
+      <button class="btn btn-primary" onclick="handleSignup()"><span id="signupBtnText">Create Account</span></button>
+      <div class="auth-switch">Already have account? <a onclick="toggleAuth()">Sign in</a></div>
+    </div>
+    <div style="margin-top:24px;padding:14px;background:rgba(212,175,55,0.05);border:1px solid var(--border);border-radius:12px;font-size:12px;color:var(--text-secondary);line-height:1.5">
+      <strong style="color:var(--gold)">Demo Mode</strong><br>
+      <a onclick="loadDemo()" style="color:var(--gold);text-decoration:underline;cursor:pointer">Explore with sample data</a> before setting up Supabase + Plaid.
+    </div>
+  </div>
+</div>
+
+<div id="appShell" class="app-shell">
+  <header class="header">
+    <div>
+      <div class="header-greeting" id="greeting">Good morning</div>
+      <div class="header-name" id="userName">Pankaj</div>
+    </div>
+    <div class="header-actions">
+      <button class="icon-btn" onclick="syncTransactions()" title="Sync (cached data)">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+      </button>
+      <button class="icon-btn" onclick="forceRefresh()" title="Force refresh ($0.10/refresh)" style="position:relative">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+        <span style="position:absolute;top:-2px;right:-2px;background:var(--gold);color:var(--navy-deep);font-size:8px;font-weight:700;padding:1px 4px;border-radius:6px;line-height:1">$</span>
+      </button>
+      <button class="icon-btn" onclick="handleLogout()" title="Sign out">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="content">
+    <div id="dashboardView" class="view active">
+      <div id="setupNotice" class="setup-notice" style="display:none">
+        <strong>⚙️ Setup Required:</strong> Edit <code>CONFIG</code> values at top of this file's script section with your Supabase URL, anon key, and Plaid client ID. See HTML comments above for full setup guide.
+      </div>
+      <div class="networth-card">
+        <div class="networth-label">Total Net Worth</div>
+        <div class="networth-value" id="netWorthValue">$0</div>
+        <div class="networth-change">
+          <span class="change-badge change-up" id="netWorthChange">+0.0%</span>
+          <span class="change-period">vs last month</span>
+        </div>
+        <div class="networth-split">
+          <div class="split-item split-personal"><div class="split-label">Personal</div><div class="split-value" id="personalNW">$0</div></div>
+          <div class="split-item split-business"><div class="split-label">Business</div><div class="split-value" id="businessNW">$0</div></div>
+        </div>
+        <div id="networthBreakdown" style="position:relative"></div>
+      </div>
+      <div class="ai-card" id="aiInsightCard" style="display:none">
+        <div class="ai-badge">AI Daily Brief</div>
+        <div class="ai-text" id="aiInsightText"></div>
+      </div>
+      <div class="month-card">
+        <div class="section-header"><div class="section-title">This Month</div><div class="section-meta" id="monthLabel">Loading...</div></div>
+        <div class="flow-grid">
+          <div class="flow-tile income"><div class="flow-tile-label">Income</div><div class="flow-tile-value" id="monthIncome">$0</div><div class="flow-tile-sub" id="incomeCount">0 transactions</div></div>
+          <div class="flow-tile expense"><div class="flow-tile-label">Expenses</div><div class="flow-tile-value" id="monthExpense">$0</div><div class="flow-tile-sub" id="expenseCount">0 transactions</div></div>
+        </div>
+        <div class="net-strip"><div class="net-strip-label">Real Net Income (Personal)</div><div class="net-strip-value" id="netIncome">$0</div></div>
+        <div class="chart-wrap"><canvas id="monthChart"></canvas></div>
+      </div>
+      <div class="due-card" id="monthlyObligationsCard" style="display:none">
+        <div class="section-header">
+          <div class="section-title">📅 Monthly Obligations</div>
+          <div class="section-meta" id="obligationsMonth">This Month</div>
+        </div>
+        <div id="obligationsBreakdown"></div>
+      </div>
+      <div class="due-card" id="dueCard" style="display:none">
+        <div class="section-header"><div class="section-title">Payments Due</div><div class="section-meta" id="dueCount">0 cards</div></div>
+        <div class="due-list" id="dueList"></div>
+      </div>
+    </div>
+
+    <div id="accountsView" class="view">
+      <div class="accounts-card">
+        <div class="section-header"><div class="section-title">All Accounts</div><div class="section-meta" id="accountCount">0 linked</div></div>
+        <div id="accountsList">
+          <div class="empty-state"><div class="empty-icon">🏦</div><div class="empty-title">No accounts linked yet</div><div class="empty-sub">Connect your first bank or credit card below</div></div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <button class="add-account-btn" onclick="openPlaidLink()" style="flex:1">+ Link Bank (Plaid)</button>
+          <button class="add-account-btn" onclick="openManualAccountModal()" style="flex:1;background:rgba(212,175,55,0.1);border:1px solid var(--gold);color:var(--gold)">+ Manual Account</button>
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);text-align:center;margin-top:8px;line-height:1.4">
+          💡 Use Manual for loans, mortgages, or accounts that Plaid doesn't support
+        </div>
+      </div>
+    </div>
+
+    <div id="transactionsView" class="view">
+      <div class="tx-card">
+        <div class="section-header"><div class="section-title">Transactions</div><div class="section-meta" id="txCount">0 items</div></div>
+        
+        <!-- Search bar -->
+        <div style="margin-bottom:12px">
+          <input type="text" class="input" id="searchInput" placeholder="🔍 Search description or merchant..." oninput="onSearchChange()" style="font-size:13px;padding:10px 14px">
+        </div>
+        
+        <!-- Inline Date Range Picker (always visible) -->
+        <div style="background:rgba(212,175,55,0.05);border:1px solid var(--border-soft);border-radius:12px;padding:12px;margin-bottom:10px">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+            <span style="font-size:13px;color:var(--gold);font-weight:600">📅 Date Range</span>
+            <span id="dateRangeLabel" style="font-size:11px;color:var(--text-muted);flex:1;text-align:right">This Month</span>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input type="date" id="inlineDateFrom" onchange="onInlineDateChange()" 
+                   style="flex:1;background:rgba(10,14,39,0.6);border:1px solid var(--border-soft);border-radius:8px;color:var(--text-primary);padding:8px 10px;font-size:13px;font-family:inherit;-webkit-appearance:none">
+            <span style="color:var(--text-muted);font-size:13px">to</span>
+            <input type="date" id="inlineDateTo" onchange="onInlineDateChange()"
+                   style="flex:1;background:rgba(10,14,39,0.6);border:1px solid var(--border-soft);border-radius:8px;color:var(--text-primary);padding:8px 10px;font-size:13px;font-family:inherit;-webkit-appearance:none">
+          </div>
+        </div>
+        
+        <!-- Quick date range chips -->
+        <div class="tx-filters" style="margin-bottom:8px">
+          <button class="tx-filter date-chip" data-date="today" onclick="setDateRange('today')">Today</button>
+          <button class="tx-filter date-chip" data-date="this_week" onclick="setDateRange('this_week')">This Week</button>
+          <button class="tx-filter date-chip active" data-date="this_month" onclick="setDateRange('this_month')">This Month</button>
+          <button class="tx-filter date-chip" data-date="last_month" onclick="setDateRange('last_month')">Last Month</button>
+          <button class="tx-filter date-chip" data-date="last_3_months" onclick="setDateRange('last_3_months')">3 Months</button>
+          <button class="tx-filter date-chip" data-date="ytd" onclick="setDateRange('ytd')">YTD</button>
+          <button class="tx-filter date-chip" data-date="last_year" onclick="setDateRange('last_year')">Last Year</button>
+          <button class="tx-filter date-chip" data-date="all" onclick="setDateRange('all')">All Time</button>
+        </div>
+        
+        <!-- Account, Institution & Type filter row -->
+        <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+          <button onclick="openInstitutionFilterModal()" class="tx-filter" id="instFilterBtn">
+            🏛️ All Banks
+          </button>
+          <button onclick="openAccountFilterModal()" class="tx-filter" id="acctFilterBtn">
+            🏦 All Accounts
+          </button>
+          <button onclick="openAmountFilterModal()" class="tx-filter" id="amountFilterBtn">
+            💰 Any Amount
+          </button>
+        </div>
+        
+        <!-- Type filter chips -->
+        <div class="tx-filters">
+          <button class="tx-filter active" data-filter="all">All</button>
+          <button class="tx-filter" data-filter="personal">Personal</button>
+          <button class="tx-filter" data-filter="business">Business</button>
+          <button class="tx-filter" data-filter="transfer">Transfers</button>
+          <button class="tx-filter" data-filter="uncategorized">Review</button>
+          <button class="tx-filter" data-filter="income">Income</button>
+        </div>
+        
+        <!-- Filter summary bar -->
+        <div id="filterSummary" style="display:none;background:rgba(212,175,55,0.05);border:1px solid var(--border-soft);border-radius:10px;padding:10px 12px;margin-bottom:12px;font-size:12px"></div>
+        
+        <div class="tx-list" id="txList">
+          <div class="empty-state"><div class="empty-icon">📊</div><div class="empty-title">No transactions yet</div><div class="empty-sub">Link an account to start syncing</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="reportsView" class="view">
+      <div class="month-card">
+        <div class="section-header"><div class="section-title">P&L Breakdown</div><div class="section-meta">Personal vs Business</div></div>
+        <div id="plBreakdown"></div>
+        <button class="btn btn-secondary" style="margin-top:16px" onclick="exportCSV()">Export to CSV</button>
+      </div>
+      <div class="month-card">
+        <div class="section-header"><div class="section-title">Top Categories</div><div class="section-meta">This month</div></div>
+        <div id="topCategories"></div>
+      </div>
+      <div class="month-card">
+        <div class="section-header">
+          <div class="section-title">📧 Daily Email Brief</div>
+          <div class="section-meta">6:00 AM EST</div>
+        </div>
+        <div style="font-size:13px;color:var(--text-secondary);line-height:1.6;margin-bottom:14px">
+          Get a beautiful morning email with:
+          <ul style="margin:8px 0 0 18px;padding:0;color:var(--text-secondary)">
+            <li>Net worth update</li>
+            <li>Yesterday's transactions grouped by account</li>
+            <li>Upcoming credit card payments due</li>
+            <li>AI insights from Gemini</li>
+          </ul>
+        </div>
+        <button class="btn btn-primary" onclick="sendTestEmail()">📤 Send Test Email Now</button>
+        <div style="font-size:11px;color:var(--text-muted);text-align:center;margin-top:8px;line-height:1.4">
+          💡 Daily email auto-sends at 6:00 AM EST. Tap above to test anytime.
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <nav class="bottom-nav">
+    <button class="nav-btn active" data-view="dashboardView">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+      HOME
+    </button>
+    <button class="nav-btn" data-view="accountsView">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="5" width="20" height="14" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>
+      ACCOUNTS
+    </button>
+    <button class="nav-btn" data-view="transactionsView">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+      ACTIVITY
+    </button>
+    <button class="nav-btn" data-view="reportsView">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+      REPORTS
+    </button>
+  </nav>
+</div>
+
+<div id="txModal" class="modal-overlay" onclick="if(event.target===this)closeTxModal()">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title" id="modalDesc">Transaction</div>
+    <div class="modal-amount" id="modalAmount">$0.00</div>
+    <div class="input-label" style="margin-bottom:8px">Classification</div>
+    <div class="toggle-group" style="grid-template-columns:1fr 1fr 1fr 1fr;gap:6px">
+      <button class="toggle-btn" data-cat="personal" onclick="setTxCategory('personal')">Personal</button>
+      <button class="toggle-btn" data-cat="business" onclick="setTxCategory('business')">Business</button>
+      <button class="toggle-btn" data-cat="transfer" onclick="setTxCategory('transfer')" style="font-size:11px">Transfer</button>
+      <button class="toggle-btn" data-cat="split" onclick="setTxCategory('split')">Split</button>
+    </div>
+    <div style="font-size:11px;color:var(--text-muted);margin-bottom:14px;padding:8px;background:rgba(212,175,55,0.05);border-radius:8px;line-height:1.5">
+      💡 <strong style="color:var(--gold)">Transfer</strong> = money moved between your own accounts (excluded from income/expense)
+    </div>
+    <div class="input-group">
+      <label class="input-label">Category</label>
+      <select class="input" id="modalCategory">
+        <option>Food & Dining</option><option>Transportation</option><option>Shopping</option>
+        <option>Utilities</option><option>Rent / Mortgage</option><option>Insurance</option>
+        <option>Healthcare</option><option>Entertainment</option><option>Travel</option>
+        <option>Income / Salary</option><option>Rental Income</option><option>Business Income</option>
+        <option>Rental Expense</option><option>CPA Practice Expense</option><option>Transfer</option><option>Other</option>
+      </select>
+    </div>
+    <div class="input-group">
+      <label class="input-label">Notes (optional)</label>
+      <input type="text" class="input" id="modalNotes" placeholder="Add a note...">
+    </div>
+    <div class="tx-detail-row"><span class="tx-detail-label">Account</span><span class="tx-detail-value" id="modalAccount">—</span></div>
+    <div class="tx-detail-row"><span class="tx-detail-label">Date</span><span class="tx-detail-value" id="modalDate">—</span></div>
+    <button class="btn btn-primary" style="margin-top:20px" onclick="saveTxChanges()">Save Changes</button>
+    <button class="btn btn-ghost" onclick="closeTxModal()">Cancel</button>
+  </div>
+</div>
+
+<!-- Institution Filter Modal -->
+<div id="instFilterModal" class="modal-overlay" onclick="if(event.target===this)closeInstFilterModal()">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title">Filter by Bank / Institution</div>
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:16px">Select banks to include (none selected = all banks)</div>
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <button onclick="selectAllInstitutions()" class="btn btn-secondary" style="padding:8px;font-size:12px">Select All</button>
+      <button onclick="clearInstitutionFilter()" class="btn btn-secondary" style="padding:8px;font-size:12px">Clear All</button>
+    </div>
+    <div id="instFilterList" style="max-height:50vh;overflow-y:auto;margin-bottom:16px"></div>
+    <button class="btn btn-primary" onclick="applyInstitutionFilter()">Apply</button>
+    <button class="btn btn-ghost" onclick="closeInstFilterModal()">Cancel</button>
+  </div>
+</div>
+
+<!-- Account Filter Modal -->
+<div id="acctFilterModal" class="modal-overlay" onclick="if(event.target===this)closeAcctFilterModal()">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title">Filter by Account</div>
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:16px">Select accounts to include (none selected = all accounts)</div>
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <button onclick="selectAllAccounts()" class="btn btn-secondary" style="padding:8px;font-size:12px">Select All</button>
+      <button onclick="clearAccountFilter()" class="btn btn-secondary" style="padding:8px;font-size:12px">Clear All</button>
+    </div>
+    <div id="acctFilterList" style="max-height:50vh;overflow-y:auto;margin-bottom:16px"></div>
+    <button class="btn btn-primary" onclick="applyAccountFilter()">Apply</button>
+    <button class="btn btn-ghost" onclick="closeAcctFilterModal()">Cancel</button>
+  </div>
+</div>
+
+<!-- Custom Date Range Modal -->
+<div id="dateRangeModal" class="modal-overlay" onclick="if(event.target===this)closeDateRangeModal()">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title">Custom Date Range</div>
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:16px">Select start and end dates</div>
+    <div class="input-group">
+      <label class="input-label">From</label>
+      <input type="date" class="input" id="customDateFrom">
+    </div>
+    <div class="input-group">
+      <label class="input-label">To</label>
+      <input type="date" class="input" id="customDateTo">
+    </div>
+    <button class="btn btn-primary" onclick="applyCustomDate()">Apply Range</button>
+    <button class="btn btn-ghost" onclick="closeDateRangeModal()">Cancel</button>
+  </div>
+</div>
+
+<!-- Amount Filter Modal -->
+<div id="amountFilterModal" class="modal-overlay" onclick="if(event.target===this)closeAmountFilterModal()">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title">Filter by Amount</div>
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:16px">Show transactions within range (leave blank for no limit)</div>
+    <div class="input-group">
+      <label class="input-label">Minimum Amount ($)</label>
+      <input type="number" step="0.01" class="input" id="amountMin" placeholder="e.g., 100">
+    </div>
+    <div class="input-group">
+      <label class="input-label">Maximum Amount ($)</label>
+      <input type="number" step="0.01" class="input" id="amountMax" placeholder="e.g., 5000">
+    </div>
+    <div style="font-size:11px;color:var(--text-muted);padding:8px;background:rgba(212,175,55,0.05);border-radius:8px;margin-bottom:12px;line-height:1.5">
+      💡 This filters by <strong style="color:var(--gold)">absolute value</strong>. Min $100 will show both +$150 (income) and -$150 (expense).
+    </div>
+    <button class="btn btn-primary" onclick="applyAmountFilter()">Apply</button>
+    <button class="btn btn-secondary" onclick="clearAmountFilter()" style="margin-top:8px">Clear</button>
+    <button class="btn btn-ghost" onclick="closeAmountFilterModal()">Cancel</button>
+  </div>
+</div>
+
+<!-- Manual Account Add/Edit Modal -->
+<div id="manualAcctModal" class="modal-overlay" onclick="if(event.target===this)closeManualAccountModal()">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title" id="manualAcctTitle">Add Manual Account</div>
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:16px">For loans, mortgages, or accounts not in Plaid</div>
+    
+    <div class="input-group">
+      <label class="input-label">Account Name *</label>
+      <input type="text" class="input" id="manualName" placeholder="e.g., Honda Auto Loan" style="font-size:13px">
+    </div>
+    
+    <div class="input-group">
+      <label class="input-label">Institution / Lender *</label>
+      <input type="text" class="input" id="manualInstitution" placeholder="e.g., Honda Financial Services" style="font-size:13px">
+    </div>
+    
+    <div class="input-group">
+      <label class="input-label">Account Type *</label>
+      <select class="input" id="manualType" style="font-size:13px">
+        <option value="checking">💵 Checking</option>
+        <option value="savings">🏦 Savings</option>
+        <option value="investment">📈 Investment</option>
+        <option value="credit">💳 Credit Card</option>
+        <option value="heloc">🏡 HELOC</option>
+        <option value="mortgage">🏠 Mortgage</option>
+        <option value="student_loan">🎓 Student Loan</option>
+        <option value="auto">🔄 Auto Loan</option>
+        <option value="loan">📋 Other Loan</option>
+        <option value="other">📦 Other</option>
+      </select>
+    </div>
+    
+    <div class="input-group">
+      <label class="input-label">Current Balance * <span style="font-size:10px;color:var(--text-muted);font-weight:normal">(positive number; loans/credit are auto-marked as liability)</span></label>
+      <input type="number" step="0.01" class="input" id="manualBalance" placeholder="e.g., 25000" style="font-size:13px">
+    </div>
+    
+    <div class="input-group">
+      <label class="input-label">Account Owner</label>
+      <select class="input" id="manualOwner" style="font-size:13px">
+        <option value="self">Self</option>
+        <option value="wife">Wife</option>
+        <option value="business">Business</option>
+      </select>
+    </div>
+    
+    <details style="margin-bottom:16px;background:rgba(212,175,55,0.05);border:1px solid var(--border-soft);border-radius:12px;padding:12px">
+      <summary style="cursor:pointer;font-size:13px;color:var(--gold);font-weight:600;padding:4px 0">
+        💳 Payment Details (Optional)
+      </summary>
+      <div style="margin-top:12px">
+        <div class="input-group" style="margin-bottom:10px">
+          <label class="input-label">Next Due Date</label>
+          <input type="date" class="input" id="manualNextDue" style="font-size:13px">
+        </div>
+        <div class="input-group" style="margin-bottom:10px">
+          <label class="input-label">Monthly Payment ($) <span style="font-size:10px;color:var(--gold);font-weight:normal">— for loans/mortgage/HELOC, enter your fixed monthly payment here</span></label>
+          <input type="number" step="0.01" class="input" id="manualMinPay" placeholder="e.g., 2400 (mortgage), 350 (auto loan)" style="font-size:13px">
+        </div>
+        <div class="input-group" style="margin-bottom:10px">
+          <label class="input-label">Statement / Total Due ($) <span style="font-size:10px;color:var(--text-muted);font-weight:normal">— optional, for credit cards</span></label>
+          <input type="number" step="0.01" class="input" id="manualPayAmount" placeholder="e.g., 850" style="font-size:13px">
+        </div>
+        <div class="input-group">
+          <label class="input-label">Payment URL (Pay Now link)</label>
+          <input type="url" class="input" id="manualPayUrl" placeholder="https://hondafinancialservices.com/login" style="font-size:13px">
+        </div>
+      </div>
+    </details>
+    
+    <details style="margin-bottom:16px;background:rgba(212,175,55,0.05);border:1px solid var(--border-soft);border-radius:12px;padding:12px">
+      <summary style="cursor:pointer;font-size:13px;color:var(--gold);font-weight:600;padding:4px 0">
+        📝 Notes (Optional)
+      </summary>
+      <div style="margin-top:12px">
+        <div class="input-group">
+          <label class="input-label">Account Notes</label>
+          <textarea class="input" id="manualNotes" rows="3" placeholder="e.g., Loan terms, account number reference, etc." style="font-size:13px;font-family:inherit;resize:vertical"></textarea>
+        </div>
+      </div>
+    </details>
+    
+    <button class="btn btn-primary" onclick="saveManualAccount()">Save Account</button>
+    <button class="btn btn-secondary" id="deleteManualAcctBtn" onclick="deleteManualAccount()" style="margin-top:8px;display:none;background:rgba(220,53,69,0.1);border:1px solid var(--red);color:var(--red)">Delete Account</button>
+    <button class="btn btn-ghost" onclick="closeManualAccountModal()">Cancel</button>
+  </div>
+</div>
+
+<!-- Account Edit Modal -->
+<div id="accountModal" class="modal-overlay" onclick="if(event.target===this)closeAccountModal()">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title" id="acctModalName">Account</div>
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:4px" id="acctModalInst">—</div>
+    <div class="modal-amount" id="acctModalBalance">$0.00</div>
+    
+    <!-- Rename Section -->
+    <details style="margin-bottom:16px;background:rgba(212,175,55,0.05);border:1px solid var(--border-soft);border-radius:12px;padding:12px">
+      <summary style="cursor:pointer;font-size:13px;color:var(--gold);font-weight:600;padding:4px 0">
+        ✏️ Rename Account / Bank
+      </summary>
+      <div style="margin-top:12px">
+        <div class="input-group" style="margin-bottom:10px">
+          <label class="input-label">Account Display Name</label>
+          <input type="text" class="input" id="customAccountName" placeholder="e.g., My Main Checking" style="font-size:13px">
+          <div style="font-size:10px;color:var(--text-muted);margin-top:4px" id="originalAcctName">Original: —</div>
+        </div>
+        <div class="input-group" style="margin-bottom:8px">
+          <label class="input-label">Bank Display Name</label>
+          <input type="text" class="input" id="customInstName" placeholder="e.g., Chase - Personal" style="font-size:13px">
+          <div style="font-size:10px;color:var(--text-muted);margin-top:4px" id="originalInstName">Original: —</div>
+          <div style="font-size:10px;color:var(--gold);margin-top:6px;line-height:1.4">
+            💡 Renaming the bank will apply to ALL accounts at this bank
+          </div>
+        </div>
+        <button onclick="clearCustomNames()" style="background:transparent;border:none;color:var(--text-muted);font-size:11px;text-decoration:underline;padding:6px 0;cursor:pointer">Reset to original names</button>
+      </div>
+    </details>
+    
+    <div class="input-label" style="margin-bottom:8px">Account Type</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:10px">
+      <button class="toggle-btn acct-type-btn" data-type="checking" onclick="setAccountType('checking')" style="font-size:11px">💵 Checking</button>
+      <button class="toggle-btn acct-type-btn" data-type="savings" onclick="setAccountType('savings')" style="font-size:11px">🏦 Savings</button>
+      <button class="toggle-btn acct-type-btn" data-type="investment" onclick="setAccountType('investment')" style="font-size:11px">📈 Investment</button>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:10px">
+      <button class="toggle-btn acct-type-btn" data-type="credit" onclick="setAccountType('credit')" style="font-size:11px">💳 Credit Card</button>
+      <button class="toggle-btn acct-type-btn" data-type="heloc" onclick="setAccountType('heloc')" style="font-size:11px">🏡 HELOC</button>
+      <button class="toggle-btn acct-type-btn" data-type="mortgage" onclick="setAccountType('mortgage')" style="font-size:11px">🏠 Mortgage</button>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:14px">
+      <button class="toggle-btn acct-type-btn" data-type="student_loan" onclick="setAccountType('student_loan')" style="font-size:11px">🎓 Student</button>
+      <button class="toggle-btn acct-type-btn" data-type="loan" onclick="setAccountType('loan')" style="font-size:11px">📋 Other Loan</button>
+      <button class="toggle-btn acct-type-btn" data-type="auto" onclick="setAccountType('auto')" style="font-size:11px">🔄 Auto</button>
+    </div>
+    
+    <div class="input-label" style="margin-bottom:8px">Account Owner</div>
+    <div class="toggle-group">
+      <button class="toggle-btn acct-owner-btn" data-owner="self" onclick="setAccountOwner('self')">Self</button>
+      <button class="toggle-btn acct-owner-btn" data-owner="wife" onclick="setAccountOwner('wife')">Wife</button>
+      <button class="toggle-btn acct-owner-btn" data-owner="business" onclick="setAccountOwner('business')">Business</button>
+    </div>
+    
+    <!-- Manual Payment Info section (credit cards AND loans) -->
+    <div id="manualDueSection" style="display:none;margin-top:8px;padding:14px;background:rgba(212,175,55,0.05);border:1px solid var(--border);border-radius:12px">
+      <div class="input-label" style="margin-bottom:8px;color:var(--gold)" id="manualDueSectionTitle">💳 Manual Payment Info</div>
+      <div style="font-size:11px;color:var(--text-muted);margin-bottom:12px;line-height:1.5" id="manualDueSectionHint">
+        Agar Plaid se due date nahi mil rahi ya galat aa rahi hai, yahan manually daalo.
+      </div>
+      <div class="input-group" style="margin-bottom:10px">
+        <label class="input-label" id="manualDueDateLabel">Due Date</label>
+        <input type="date" class="input" id="manualDueDate">
+      </div>
+      <div class="input-group" style="margin-bottom:10px">
+        <label class="input-label" id="manualMinPaymentLabel">Monthly Payment ($)</label>
+        <input type="number" step="0.01" class="input" id="manualMinPayment" placeholder="0.00">
+      </div>
+      <div class="input-group" style="margin-bottom:4px">
+        <label class="input-label" id="manualDueAmountLabel">Statement / Total Due ($)</label>
+        <input type="number" step="0.01" class="input" id="manualDueAmount" placeholder="0.00">
+      </div>
+      <button onclick="clearManualDue()" style="background:transparent;border:none;color:var(--text-muted);font-size:11px;text-decoration:underline;padding:8px 0;cursor:pointer">Clear manual entries (use Plaid data)</button>
+    </div>
+    
+    <div style="font-size:11px;color:var(--text-muted);margin-top:14px;margin-bottom:14px;padding:8px;background:rgba(212,175,55,0.05);border-radius:8px;line-height:1.5">
+      💡 <strong style="color:var(--gold)">Auto-detected:</strong> <span id="acctAutoType">—</span>
+    </div>
+    <button class="btn btn-primary" style="margin-top:8px" onclick="saveAccountChanges()">Save</button>
+    <button class="btn btn-ghost" onclick="closeAccountModal()">Cancel</button>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+// =============================================================
+// CONFIG - YAHA APNE KEYS DALO (Setup guide HTML comments me hai upar)
+// =============================================================
+const CONFIG = {
+  SUPABASE_URL: 'https://xtsqmlnsqhbqyqjrmfmj.supabase.co',
+  SUPABASE_ANON_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh0c3FtbG5zcWhicXlxanJtZm1qIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg2MjQ3ODIsImV4cCI6MjA5NDIwMDc4Mn0.NhvapBNjJkG1M07jo0fqgJ-qF9a6qf14YwszUk0yZeU',
+  PLAID_CLIENT_ID: '6a03d961882743000d115069',
+  PLAID_ENV: 'production'
+};
+// =============================================================
+
+const CAT_EMOJI = {
+  'Food & Dining':'🍽️','Transportation':'🚗','Shopping':'🛍️','Utilities':'💡',
+  'Rent / Mortgage':'🏠','Insurance':'🛡️','Healthcare':'⚕️','Entertainment':'🎬',
+  'Travel':'✈️','Income / Salary':'💰','Rental Income':'🏘️','Business Income':'💼',
+  'Rental Expense':'🔧','CPA Practice Expense':'📊','Other':'📝','Transfer':'↔️'
+};
+
+// =============================================================
+// ACCOUNT CLASSIFICATION HELPERS
+// =============================================================
+// Plaid account types: depository, credit, loan, investment, other
+// Plaid subtypes: checking, savings, money market, cd, credit card,
+//                 mortgage, student, auto, personal, line of credit, etc.
+
+function getAccountGroup(a){
+  // Check if user has manually overridden the type
+  if(a.user_type){
+    return a.user_type;
+  }
+  
+  // Use robust loan detection first (handles HELOC, mortgage subtded variations)
+  const loanType = detectLoanType(a);
+  if(loanType) return loanType;
+  
+  const type = (a.type || '').toLowerCase();
+  const subtype = (a.subtype || '').toLowerCase();
+  const name = (a.name || '').toLowerCase();
+  
+  if(type === 'depository'){
+    if(subtype === 'money market' || subtype === 'cd') return 'savings';
+    return subtype === 'savings' ? 'savings' : 'checking';
+  }
+  if(type === 'investment' || subtype === 'brokerage' || subtype === '401k' || subtype === 'ira' || subtype === 'roth') return 'investment';
+  if(type === 'credit') return 'credit';
+  if(type === 'loan'){
+    if(subtype === 'mortgage') return 'mortgage';
+    if(subtype === 'student') return 'student_loan';
+    return 'loan';
+  }
+  return 'other';
+}
+
+// Robustly detect if an account is a loan/liability type, and which kind.
+// Handles Plaid variations (subtype 'home equity', 'line of credit', etc.)
+// and manual entries. Returns the normalized type or null.
+function detectLoanType(a){
+  // Priority 1: user_type override (manual selection wins)
+  const ut = (a.user_type || '').toLowerCase().trim();
+  if(['heloc','mortgage','student_loan','auto','loan'].includes(ut)) return ut;
+  
+  // Gather all text signals
+  const subtype = (a.subtype || '').toLowerCase();
+  const type = (a.type || '').toLowerCase();
+  const name = (a.name || '').toLowerCase();
+  const inst = (a.institution || '').toLowerCase();
+  const allText = `${subtype} ${name} ${inst}`;
+  
+  // HELOC detection - Plaid uses various subtypes
+  if(allText.includes('heloc') || allText.includes('home equity') || 
+     allText.includes('line of credit') || subtype === 'line of credit' ||
+     (allText.includes('equity') && allText.includes('line'))){
+    return 'heloc';
+  }
+  
+  // Mortgage detection
+  if(allText.includes('mortgage') || subtype === 'mortgage' || 
+     allText.includes('home loan')){
+    return 'mortgage';
+  }
+  
+  // Student loan
+  if(allText.includes('student') || subtype === 'student' || 
+     allText.includes('sallie mae') || allText.includes('navient') || 
+     allText.includes('nelnet')){
+    return 'student_loan';
+  }
+  
+  // Auto loan
+  if(allText.includes('auto') || allText.includes('vehicle') || 
+     allText.includes('car loan') || subtype === 'auto'){
+    return 'auto';
+  }
+  
+  // Generic loan (Plaid type 'loan')
+  if(type === 'loan' || subtype === 'loan' || subtype.includes('loan')){
+    return 'loan';
+  }
+  
+  return null; // not a loan
+}
+
+// Is this account a liability (debt)?
+function isLiability(a){
+  const g = getAccountGroup(a);
+  return ['credit','loan','mortgage','student_loan','heloc'].includes(g);
+}
+
+// Group config: label, icon, isAsset
+const GROUP_CONFIG = {
+  checking:     { label:'Checking',        icon:'💵', isAsset:true,  order:1 },
+  savings:      { label:'Savings & CDs',   icon:'🏦', isAsset:true,  order:2 },
+  investment:   { label:'Investments',     icon:'📈', isAsset:true,  order:3 },
+  credit:       { label:'Credit Cards',    icon:'💳', isAsset:false, order:4 },
+  heloc:        { label:'HELOC',           icon:'🏡', isAsset:false, order:5 },
+  mortgage:     { label:'Mortgage',        icon:'🏠', isAsset:false, order:6 },
+  auto:         { label:'Auto Loans',      icon:'🔄', isAsset:false, order:7 },
+  student_loan: { label:'Student Loans',   icon:'🎓', isAsset:false, order:8 },
+  loan:         { label:'Loans',           icon:'📋', isAsset:false, order:9 },
+  other:        { label:'Other',           icon:'📦', isAsset:true,  order:10 }
+};
+
+// Credit card payment URLs by institution
+function getPayUrl(a){
+  if(a.pay_url) return a.pay_url;
+  const inst = (a.institution || '').toLowerCase();
+  const name = (a.name || '').toLowerCase();
+  if(inst.includes('chase') || name.includes('chase')) return 'https://secure.chase.com/web/auth/dashboard';
+  if(inst.includes('american express') || inst.includes('amex')) return 'https://www.americanexpress.com/en-us/account/login';
+  if(inst.includes('discover')) return 'https://www.discover.com/credit-cards/member/login';
+  if(inst.includes('capital one')) return 'https://verified.capitalone.com/auth/signin';
+  if(inst.includes('citi')) return 'https://www.citi.com/US/login.do';
+  if(inst.includes('bank of america') || inst.includes('boa')) return 'https://secure.bankofamerica.com/login/sign-in/signOn.go';
+  if(inst.includes('wells fargo')) return 'https://connect.secure.wellsfargo.com/auth/login/present';
+  if(inst.includes('us bank')) return 'https://onlinebanking.usbank.com/Auth/Login';
+  if(inst.includes('barclays')) return 'https://www.barclaycardus.com/servicing/login';
+  if(inst.includes('synchrony')) return 'https://www.mysynchrony.com/login';
+  return 'https://google.com/search?q=' + encodeURIComponent((a.institution || '') + ' login');
+}
+
+// Check if credit card is actually overdue (not just past due_date if paid)
+function isOverdue(a){
+  if(!a.dueDate) return false;
+  
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  const dueDay = new Date(a.dueDate + (a.dueDate.length === 10 ? 'T00:00:00' : ''));
+  dueDay.setHours(0,0,0,0);
+  const daysUntilDue = Math.round((dueDay - today) / 86400000);
+  
+  if(daysUntilDue >= 0) return false; // future or today's due date - not overdue
+  
+  // Past due date - check if payment was made recently
+  const payDate = a.lastPaymentDate ? new Date(a.lastPaymentDate) : null;
+  const stmtDate = a.lastStatementDate ? new Date(a.lastStatementDate) : null;
+  const stmtBalance = Number(a.dueAmount || 0);
+  const payAmount = Number(a.lastPaymentAmount || 0);
+  const currentBalance = Math.abs(Number(a.balance || 0));
+  
+  // CASE 0: Balance is essentially zero = definitely paid, not overdue
+  if(currentBalance <= 1) return false;
+  
+  // CASE 1: Payment made ON or AFTER the due date = paid on time (or close to it)
+  // This is the key fix: if you paid around the due date, you're NOT overdue
+  if(payDate){
+    const payDay = new Date(payDate);
+    payDay.setHours(0,0,0,0);
+    const daysFromDueToPay = Math.round((payDay - dueDay) / 86400000);
+    // Payment within 5 days before due date through 7 days after = considered handled
+    if(daysFromDueToPay >= -5 && daysFromDueToPay <= 7 && payAmount > 0){
+      return false; // Paid around due date - not overdue
+    }
+  }
+  
+  // CASE 2: Payment after statement with sufficient amount = paid
+  if(payDate && stmtDate && payDate >= stmtDate && payAmount >= stmtBalance * 0.90){
+    return false;
+  }
+  
+  // CASE 3: Recent payment (last 35 days) covering most of statement = paid
+  if(payDate && payAmount > 0){
+    const daysSincePayment = Math.ceil((new Date() - payDate) / 86400000);
+    if(daysSincePayment <= 35 && payAmount >= stmtBalance * 0.90){
+      return false;
+    }
+  }
+  
+  // CASE 4: Manual due date - user manages it themselves, be lenient
+  if(a.isManualDueDate){
+    return daysUntilDue < -30;
+  }
+  
+  // Otherwise yes, it's overdue
+  return true;
+}
+
+// Has this credit card been paid for the current cycle? (should it be hidden / shown as $0?)
+function isPaidForCycle(a){
+  const currentBalance = Math.abs(Number(a.balance || 0));
+  
+  // Balance essentially zero = definitely paid/nothing due
+  if(currentBalance <= 1) return true;
+  
+  if(!a.lastPaymentDate) return false;
+  
+  const payDate = new Date(a.lastPaymentDate);
+  const stmtDate = a.lastStatementDate ? new Date(a.lastStatementDate) : null;
+  const dueDate = a.dueDate ? new Date(a.dueDate + (a.dueDate.length === 10 ? 'T00:00:00' : '')) : null;
+  const stmtBalance = Number(a.dueAmount || 0);
+  const payAmount = Number(a.lastPaymentAmount || 0);
+  
+  // RULE 1: Payment made on/around due date covering statement balance = cycle paid
+  if(dueDate && payDate){
+    const payDay = new Date(payDate); payDay.setHours(0,0,0,0);
+    const dueDay = new Date(dueDate); dueDay.setHours(0,0,0,0);
+    const daysFromDueToPay = Math.round((payDay - dueDay) / 86400000);
+    // Paid within window around due date AND covers statement balance
+    if(daysFromDueToPay >= -7 && daysFromDueToPay <= 7 && payAmount >= stmtBalance * 0.90 && stmtBalance > 0){
+      return true; // Statement paid for this cycle
+    }
+  }
+  
+  // RULE 2: Payment covers FULL current balance = truly paid up
+  if(stmtDate && payDate >= stmtDate && payAmount >= currentBalance * 0.95){
+    return true;
+  }
+  
+  // RULE 3: Payment after statement covers statement balance (new charges may exist but statement is paid)
+  // We still SHOW these but they shouldn't be "overdue" - handled by isOverdue
+  
+  return false;
+}
+
+let state = { 
+  user:null, accounts:[], transactions:[], 
+  currentView:'dashboardView', currentFilter:'all', 
+  currentTx:null, currentAccount:null,
+  isDemo:false, supabase:null,
+  // Activity filters
+  filterDateRange: 'this_month',
+  filterDateFrom: null,
+  filterDateTo: null,
+  filterAccounts: new Set(), // empty = all
+  filterInstitutions: new Set(), // empty = all
+  filterSearch: '',
+  filterMinAmount: null,
+  filterMaxAmount: null,
+};
+
+window.addEventListener('DOMContentLoaded', async () => {
+  setGreeting();
+  if(!CONFIG.SUPABASE_URL.includes('YOUR_')){
+    state.supabase = supabase.createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY);
+    const { data: { session } } = await state.supabase.auth.getSession();
+    if(session){ state.user = session.user; showApp(); await loadUserData(); }
+  } else {
+    document.getElementById('setupNotice').style.display = 'block';
+  }
+  document.querySelectorAll('.nav-btn').forEach(btn => btn.addEventListener('click', () => switchView(btn.dataset.view)));
+  // Type filter buttons (use data-filter, NOT date-chip class)
+  document.querySelectorAll('.tx-filter[data-filter]').forEach(btn => btn.addEventListener('click', () => {
+    document.querySelectorAll('.tx-filter[data-filter]').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active'); state.currentFilter = btn.dataset.filter; renderTransactions();
+  }));
+  // Initialize inline date pickers with default "this_month"
+  setDateRange('this_month');
+});
+
+function setGreeting(){
+  const h = new Date().getHours();
+  document.getElementById('greeting').textContent = h < 12 ? 'Good morning' : (h < 17 ? 'Good afternoon' : 'Good evening');
+}
+
+function toggleAuth(){
+  const l = document.getElementById('loginForm'), s = document.getElementById('signupForm');
+  l.style.display = l.style.display === 'none' ? 'block' : 'none';
+  s.style.display = s.style.display === 'none' ? 'block' : 'none';
+}
+
+async function handleLogin(){
+  const email = document.getElementById('loginEmail').value.trim();
+  const password = document.getElementById('loginPassword').value;
+  if(!email || !password){ showToast('Enter email and password'); return; }
+  if(!state.supabase){ showToast('Setup CONFIG first'); return; }
+  document.getElementById('loginBtnText').innerHTML = '<span class="loader"></span>';
+  const { data, error } = await state.supabase.auth.signInWithPassword({ email, password });
+  document.getElementById('loginBtnText').textContent = 'Sign In';
+  if(error){ showToast(error.message); return; }
+  state.user = data.user; showApp(); await loadUserData();
+}
+
+async function handleSignup(){
+  const name = document.getElementById('signupName').value.trim();
+  const email = document.getElementById('signupEmail').value.trim();
+  const password = document.getElementById('signupPassword').value;
+  if(!name || !email || !password){ showToast('Fill all fields'); return; }
+  if(!state.supabase){ showToast('Setup CONFIG first'); return; }
+  document.getElementById('signupBtnText').innerHTML = '<span class="loader"></span>';
+  const { error } = await state.supabase.auth.signUp({ email, password, options:{ data:{ full_name: name } } });
+  document.getElementById('signupBtnText').textContent = 'Create Account';
+  if(error){ showToast(error.message); return; }
+  showToast('Account created! Check email to verify.'); toggleAuth();
+}
+
+async function handleLogout(){
+  if(state.isDemo){ state.isDemo = false; state.user = null; location.reload(); return; }
+  if(state.supabase) await state.supabase.auth.signOut();
+  location.reload();
+}
+
+function showApp(){
+  document.getElementById('authScreen').style.display = 'none';
+  document.getElementById('appShell').classList.add('active');
+  document.getElementById('userName').textContent = state.user?.user_metadata?.full_name || state.user?.email?.split('@')[0] || 'there';
+  // Start auto-refresh every 60 seconds
+  startAutoRefresh();
+}
+
+function loadDemo(){
+  state.isDemo = true;
+  state.user = { email:'demo@wealthpulse.app', user_metadata:{ full_name:'Pankaj' } };
+  state.accounts = [
+    { id:'a1', name:'Chase Sapphire', type:'credit', subtype:'credit card', balance:-2847.32, owner:'self', institution:'Chase', dueDate: addDays(8), dueAmount:2847.32, minPayment:75, payUrl:'https://chase.com' },
+    { id:'a2', name:'Amex Gold', type:'credit', subtype:'credit card', balance:-1240.18, owner:'self', institution:'Amex', dueDate: addDays(3), dueAmount:1240.18, minPayment:40, payUrl:'https://americanexpress.com' },
+    { id:'a3', name:'BoA Checking', type:'depository', subtype:'checking', balance:12480.55, owner:'self', institution:'Bank of America' },
+    { id:'a4', name:'BoA Savings', type:'depository', subtype:'savings', balance:48200.00, owner:'self', institution:'Bank of America' },
+    { id:'a5', name:'Wife Checking', type:'depository', subtype:'checking', balance:6520.40, owner:'wife', institution:'Wells Fargo' },
+    { id:'a6', name:'Wife Discover', type:'credit', subtype:'credit card', balance:-680.50, owner:'wife', institution:'Discover', dueDate: addDays(14), dueAmount:680.50, minPayment:25, payUrl:'https://discover.com' },
+    { id:'a7', name:'PennIndus Business', type:'depository', subtype:'checking', balance:18420.00, owner:'business', institution:'PNC Bank' }
+  ];
+  state.transactions = [
+    tx(0,-87.45,'Whole Foods Market','a3','Food & Dining','personal','self'),
+    tx(0,-42.18,'Shell Gas Station','a3','Transportation','personal','self'),
+    tx(1,-1850.00,'Mortgage Payment','a3','Rent / Mortgage','personal','self'),
+    tx(1,8500.00,'Fannie Mae Payroll','a3','Income / Salary','income','self'),
+    tx(2,-128.00,'Home Depot - Rental Repair','a7','Rental Expense','business','business'),
+    tx(2,-65.00,'Verizon Wireless','a3','Utilities','personal','self'),
+    tx(3,2400.00,'Rental Income - Colonial Cross','a7','Rental Income','business','business'),
+    tx(3,-385.20,'Costco Wholesale','a1','Shopping','personal','self'),
+    tx(4,-22.50,'Starbucks','a5','Food & Dining','personal','wife'),
+    tx(4,-145.00,'TurboTax Software','a3','CPA Practice Expense','business','business'),
+    tx(5,-89.00,'Comcast Internet','a3','Utilities','personal','self'),
+    tx(5,1200.00,'CPA Client - Smith Tax Return','a3','Business Income','business','business'),
+    tx(6,-220.00,'AAA Auto Insurance','a3','Insurance','personal','self'),
+    tx(7,3500.00,'Rental Income - York PA','a7','Rental Income','business','business'),
+    tx(7,-1200.00,'HOA Quarterly Fee','a7','Rental Expense','business','business'),
+    tx(8,-450.00,'Daughter Math Coaching','a3','Other','personal','self'),
+    tx(9,-32.00,'Netflix + Spotify','a1','Entertainment','personal','self'),
+    tx(11,8500.00,'Fannie Mae Payroll','a3','Income / Salary','income','self'),
+    tx(14,-3200.00,'Property Tax Payment','a7','Rental Expense','business','business')
+  ];
+  showApp(); renderAll(); showToast('Demo loaded!');
+}
+
+function tx(daysAgo, amount, desc, accountId, category, type, owner){
+  const d = new Date(); d.setDate(d.getDate() - daysAgo);
+  return { id:'t'+Math.random().toString(36).slice(2,9), date: d.toISOString().slice(0,10), amount, description:desc, accountId, category, type, owner, merchant: desc.split(' ')[0] };
+}
+function addDays(n){ const d = new Date(); d.setDate(d.getDate() + n); return d.toISOString().slice(0,10); }
+
+async function loadUserData(forceFresh = false){
+  if(!state.supabase || !state.user) return;
+  try{
+    // Force fresh data from Supabase (bypass any caching)
+    const accountsQuery = state.supabase
+      .from('accounts')
+      .select('*')
+      .eq('user_id', state.user.id);
+    
+    const txsQuery = state.supabase
+      .from('transactions')
+      .select('*')
+      .eq('user_id', state.user.id)
+      .order('date', { ascending: false });
+    
+    const [{ data: accounts }, { data: txs }] = await Promise.all([accountsQuery, txsQuery]);
+    
+    state.accounts = (accounts || []).map(a => ({ 
+      ...a, 
+      // Display name uses custom_name if set, falls back to original
+      displayName: a.custom_name || a.name,
+      displayInstitution: a.custom_institution || a.institution,
+      dueDate: a.manual_due_date || a.due_date,
+      dueAmount: a.manual_due_amount || a.due_amount,
+      minPayment: a.manual_min_payment || a.min_payment,
+      payUrl: a.pay_url,
+      lastPaymentDate: a.last_payment_date,
+      lastPaymentAmount: a.last_payment_amount,
+      lastStatementDate: a.last_statement_date,
+      isManualDueDate: !!a.manual_due_date
+    }));
+    state.transactions = (txs || []).map(t => ({ 
+      id:t.id, date:t.date, amount:Number(t.amount), description:t.description, 
+      accountId:t.account_id, category:t.category, type:t.tx_type, owner:t.owner, 
+      merchant:t.merchant, notes:t.notes, excluded:t.excluded 
+    }));
+    renderAll();
+    
+    if(forceFresh){
+      const newest = state.accounts[0]?.updated_at;
+      if(newest){
+        const updatedTime = new Date(newest).toLocaleTimeString('en-US', {hour:'numeric', minute:'2-digit'});
+        showToast(`Updated as of ${updatedTime}`);
+      }
+    }
+  }catch(e){ 
+    console.error('Load error:', e); 
+    showToast('Failed to load: ' + e.message);
+  }
+}
+
+// Auto-refresh data every 60 seconds while app is open
+let autoRefreshInterval = null;
+function startAutoRefresh(){
+  if(autoRefreshInterval) clearInterval(autoRefreshInterval);
+  autoRefreshInterval = setInterval(() => {
+    if(state.user && !state.isDemo && document.visibilityState === 'visible'){
+      loadUserData(false);
+    }
+  }, 60000); // 60 seconds
+}
+
+// Refresh when user returns to app (e.g., after force refresh wait)
+document.addEventListener('visibilitychange', () => {
+  if(document.visibilityState === 'visible' && state.user && !state.isDemo){
+    loadUserData(false);
+  }
+});
+
+function renderAll(){ renderDashboard(); renderAccounts(); renderTransactions(); renderReports(); renderAIInsight(); }
+
+function renderDashboard(){
+  // Build asset/liability breakdown
+  const groups = {};
+  let totalAssets = 0, totalLiabilities = 0;
+  let personalAssets = 0, personalLiabilities = 0;
+  let businessAssets = 0, businessLiabilities = 0;
+  
+  state.accounts.forEach(a => {
+    const g = getAccountGroup(a);
+    const config = GROUP_CONFIG[g];
+    if(!groups[g]) groups[g] = { total:0, count:0, accounts:[], config };
+    
+    // For liabilities, Plaid returns positive balance (how much you owe)
+    // For assets, balance is positive too
+    // We treat liability balances as negative for net worth math
+    const bal = Math.abs(Number(a.balance || 0));
+    groups[g].total += bal;
+    groups[g].count++;
+    groups[g].accounts.push(a);
+    
+    const isOwnerPersonal = a.owner === 'self' || a.owner === 'wife' || !a.owner;
+    
+    if(config.isAsset){
+      totalAssets += bal;
+      if(isOwnerPersonal) personalAssets += bal;
+      else businessAssets += bal;
+    } else {
+      totalLiabilities += bal;
+      if(isOwnerPersonal) personalLiabilities += bal;
+      else businessLiabilities += bal;
+    }
+  });
+  
+  const netWorth = totalAssets - totalLiabilities;
+  const personalNW = personalAssets - personalLiabilities;
+  const businessNW = businessAssets - businessLiabilities;
+  
+  document.getElementById('netWorthValue').textContent = fmt(netWorth);
+  document.getElementById('personalNW').textContent = fmt(personalNW);
+  document.getElementById('businessNW').textContent = fmt(businessNW);
+
+  // Render breakdown card
+  renderNetWorthBreakdown(groups, totalAssets, totalLiabilities);
+
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  // Exclude transfers and excluded from monthly income/expense calculations
+  const mt = state.transactions.filter(t => 
+    parseLocalDate(t.date) >= monthStart && 
+    t.type !== 'transfer' && 
+    !t.excluded
+  );
+  const income = mt.filter(t => t.amount > 0 && t.type !== 'business').reduce((s,t) => s + t.amount, 0);
+  const expenses = mt.filter(t => t.amount < 0 && t.type === 'personal').reduce((s,t) => s + Math.abs(t.amount), 0);
+
+  document.getElementById('monthLabel').textContent = now.toLocaleDateString('en-US',{month:'long',year:'numeric'});
+  document.getElementById('monthIncome').textContent = fmt(income);
+  document.getElementById('monthExpense').textContent = fmt(expenses);
+  document.getElementById('incomeCount').textContent = mt.filter(t => t.amount > 0 && t.type !== 'business').length + ' transactions';
+  document.getElementById('expenseCount').textContent = mt.filter(t => t.amount < 0 && t.type === 'personal').length + ' transactions';
+  document.getElementById('netIncome').textContent = fmt(income - expenses);
+  document.getElementById('netWorthChange').textContent = netWorth > 0 ? '+2.4%' : '0.0%';
+  renderMonthChart(mt);
+  renderDues();
+  renderMonthlyObligations();
+}
+
+function renderNetWorthBreakdown(groups, totalAssets, totalLiabilities){
+  let html = '';
+  const sortedGroups = Object.entries(groups).sort((a,b) => a[1].config.order - b[1].config.order);
+  
+  // Assets section
+  const assetGroups = sortedGroups.filter(([k,v]) => v.config.isAsset);
+  if(assetGroups.length){
+    html += '<div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border-soft);position:relative">';
+    html += '<div style="font-size:11px;color:var(--green);letter-spacing:0.15em;text-transform:uppercase;font-weight:600;margin-bottom:10px">Assets</div>';
+    assetGroups.forEach(([key, g]) => {
+      html += `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0">
+        <span style="font-size:13px;color:var(--text-secondary)">${g.config.icon} ${g.config.label} <span style="color:var(--text-muted);font-size:11px">(${g.count})</span></span>
+        <span style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-primary)">${fmt(g.total)}</span>
+      </div>`;
+    });
+    html += `<div style="display:flex;justify-content:space-between;align-items:center;padding-top:8px;margin-top:6px;border-top:1px dashed var(--border-soft)">
+      <span style="font-size:12px;color:var(--text-secondary);font-weight:600">Total Assets</span>
+      <span style="font-family:'JetBrains Mono',monospace;font-size:14px;color:var(--green);font-weight:600">${fmt(totalAssets)}</span>
+    </div>`;
+    html += '</div>';
+  }
+  
+  // Liabilities section
+  const liabGroups = sortedGroups.filter(([k,v]) => !v.config.isAsset);
+  if(liabGroups.length){
+    html += '<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border-soft);position:relative">';
+    html += '<div style="font-size:11px;color:var(--red);letter-spacing:0.15em;text-transform:uppercase;font-weight:600;margin-bottom:10px">Liabilities</div>';
+    liabGroups.forEach(([key, g]) => {
+      html += `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0">
+        <span style="font-size:13px;color:var(--text-secondary)">${g.config.icon} ${g.config.label} <span style="color:var(--text-muted);font-size:11px">(${g.count})</span></span>
+        <span style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-primary)">-${fmt(g.total)}</span>
+      </div>`;
+    });
+    html += `<div style="display:flex;justify-content:space-between;align-items:center;padding-top:8px;margin-top:6px;border-top:1px dashed var(--border-soft)">
+      <span style="font-size:12px;color:var(--text-secondary);font-weight:600">Total Liabilities</span>
+      <span style="font-family:'JetBrains Mono',monospace;font-size:14px;color:var(--red);font-weight:600">-${fmt(totalLiabilities)}</span>
+    </div>`;
+    html += '</div>';
+  }
+  
+  const breakdownDiv = document.getElementById('networthBreakdown');
+  if(breakdownDiv) breakdownDiv.innerHTML = html;
+}
+
+function renderDues(){
+  // Show ALL credit cards with a balance > $1, regardless of due_date availability
+  const creditCards = state.accounts.filter(a => {
+    if(a.type !== 'credit' && getAccountGroup(a) !== 'credit') return false;
+    const bal = Math.abs(Number(a.balance || 0));
+    if(bal < 1) return false; // Zero balance = nothing to pay
+    return true;
+  });
+  
+  // Debug: log what was found and why some might be excluded
+  console.log('[renderDues] Found', creditCards.length, 'credit cards with balance > $1:');
+  creditCards.forEach(c => {
+    console.log(`  - ${c.displayName || c.name} (${c.institution}): bal=${c.balance}, dueDate=${c.dueDate}, paidForCycle=${isPaidForCycle(c)}, overdue=${isOverdue(c)}`);
+  });
+  
+  // Separate into: actually due/overdue, paid (hide), unknown due date
+  const dueCards = creditCards.filter(c => {
+    // No due date at all - show with "Add due date" prompt
+    if(!c.dueDate) return true;
+    // Paid for cycle - hide
+    if(isPaidForCycle(c)) {
+      console.log(`  ⚠️ Hiding ${c.displayName || c.name} - marked as paid for cycle`);
+      return false;
+    }
+    // Future due date with balance - show
+    const days = Math.ceil((new Date(c.dueDate) - new Date()) / 86400000);
+    if(days >= 0) return true;
+    // Past due - only show if actually overdue per logic
+    return isOverdue(c);
+  });
+  
+  console.log('[renderDues] Showing', dueCards.length, 'cards in due list');
+  
+  if(dueCards.length === 0){
+    document.getElementById('dueCard').style.display = 'none';
+    return;
+  }
+  document.getElementById('dueCard').style.display = 'block';
+  document.getElementById('dueCount').textContent = dueCards.length + ' card' + (dueCards.length !== 1 ? 's' : '');
+  const list = document.getElementById('dueList');
+  list.innerHTML = '';
+  
+  // Sort: cards with due dates first (by date), then cards without due dates
+  dueCards.sort((a, b) => {
+    if(!a.dueDate && !b.dueDate) return 0;
+    if(!a.dueDate) return 1;
+    if(!b.dueDate) return -1;
+    return new Date(a.dueDate) - new Date(b.dueDate);
+  }).forEach(c => {
+    const payUrl = getPayUrl(c);
+    const currentBalance = Math.abs(Number(c.balance || 0));
+    const stmtBalance = Number(c.dueAmount || 0);
+    
+    let dueLabel = '', urgency = 'ok', displayAmount = 0, metaText = '';
+    
+    if(!c.dueDate){
+      // No due date info - just show balance, prompt to add due date
+      dueLabel = 'NO DATE';
+      urgency = 'soon';
+      displayAmount = currentBalance;
+      metaText = `${c.institution || ''} • Balance: ${fmt(currentBalance)} • Tap to set due date`;
+    } else {
+      const today = new Date(); today.setHours(0,0,0,0);
+      const dueDay = new Date(c.dueDate + (c.dueDate.length === 10 ? 'T00:00:00' : ''));
+      dueDay.setHours(0,0,0,0);
+      const days = Math.round((dueDay - today) / 86400000);
+      const manualTag = c.isManualDueDate ? ' <span style="font-size:10px;color:var(--gold)">(manual)</span>' : '';
+      const paidCycle = isPaidForCycle(c);
+      const overdue = isOverdue(c);
+      
+      if(paidCycle || currentBalance <= 1){
+        // Paid for this cycle - $0 due, green, show next due date
+        dueLabel = 'PAID';
+        urgency = 'ok';
+        displayAmount = 0;
+        metaText = `${c.institution || ''} • ✓ Paid • Next due ${formatDueDate(c.dueDate)}${manualTag}`;
+      } else if(overdue){
+        // Genuinely overdue (past due date AND not paid)
+        dueLabel = 'OVERDUE';
+        urgency = 'urgent';
+        displayAmount = stmtBalance > 0 ? stmtBalance : currentBalance;
+        metaText = `${c.institution || ''} • Min: ${fmt(c.minPayment || 0)} • Was due ${formatDueDate(c.dueDate)}${manualTag}`;
+      } else {
+        // Upcoming payment
+        urgency = days <= 3 ? 'urgent' : (days <= 7 ? 'soon' : 'ok');
+        dueLabel = days === 0 ? 'TODAY' : (days === 1 ? 'TOMORROW' : `${days} days`);
+        displayAmount = stmtBalance > 0 ? stmtBalance : currentBalance;
+        metaText = `${c.institution || ''} • Min: ${fmt(c.minPayment || 0)} • Due ${formatDueDate(c.dueDate)}${manualTag}`;
+      }
+    }
+    
+    const item = document.createElement('div');
+    item.className = 'due-item';
+    item.style.cursor = 'pointer';
+    // Tap on card to open account modal (for manual due date entry)
+    item.onclick = (e) => {
+      if(e.target.classList.contains('pay-btn')) return;
+      openAccountModal(c);
+    };
+    item.innerHTML = `
+      <div class="due-item-info">
+        <div class="due-item-name">${c.displayName || c.name} ${c.owner === 'wife' ? '<span class="account-owner wife">Wife</span>' : ''}</div>
+        <div class="due-item-meta">${metaText}</div>
+        <a class="pay-btn" href="${payUrl}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Pay Now →</a>
+      </div>
+      <div class="due-item-amount">
+        <div class="due-amount">${fmt(displayAmount)}</div>
+        <div class="due-days ${urgency}">${dueLabel}</div>
+      </div>`;
+    list.appendChild(item);
+  });
+}
+
+// Precisely detect THIS MONTH's payment for a specific loan account.
+// Unlike the old buggy version, this requires a STRONG match to the specific
+// account (full institution name or account name), so one loan's payment
+// can never match another loan account.
+function detectThisMonthLoanPayment(account, monthStart, monthEnd){
+  if(!state.transactions || state.transactions.length === 0) return 0;
+  
+  const inst = (account.institution || '').toLowerCase().trim();
+  const acctName = (account.name || '').toLowerCase().trim();
+  
+  // Build a STRONG, distinctive match string. Need the full institution name
+  // (not individual words) to avoid cross-matching between loans.
+  // e.g. "rocketloans", "firstmark", "penfed credit union", "sps"
+  const strongMatches = [];
+  if(inst.length >= 4) strongMatches.push(inst);
+  // Also the institution with spaces removed (banks often appear concatenated)
+  if(inst.includes(' ')) strongMatches.push(inst.replace(/\s+/g, ''));
+  // Account name only if it's distinctive (not generic like "personal loan")
+  const genericNames = ['personal loan', 'loan', 'mortgage', 'heloc', 'auto loan', 'line of credit'];
+  if(acctName.length >= 5 && !genericNames.includes(acctName)){
+    strongMatches.push(acctName);
+  }
+  
+  if(strongMatches.length === 0) return 0;
+  
+  // Find outgoing payments THIS MONTH that strongly match this specific account
+  const matches = state.transactions.filter(t => {
+    if(Number(t.amount) >= 0) return false; // outgoing only
+    const txDate = new Date(t.date + (t.date.length === 10 ? 'T00:00:00' : ''));
+    if(txDate < monthStart || txDate > monthEnd) return false;
+    const text = ((t.description || '') + ' ' + (t.merchant || '')).toLowerCase();
+    // Require a STRONG match - full institution/account name must appear
+    return strongMatches.some(m => text.includes(m));
+  });
+  
+  if(matches.length === 0) return 0;
+  
+  // Sum this month's payments to this loan (could be one payment, or split)
+  const total = matches.reduce((s, t) => s + Math.abs(Number(t.amount)), 0);
+  return Math.round(total * 100) / 100;
+}
+
+// Render Monthly Obligations - total of what's due THIS month across loans + credit cards
+function renderMonthlyObligations(){
+  const card = document.getElementById('monthlyObligationsCard');
+  const breakdown = document.getElementById('obligationsBreakdown');
+  
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
+  const monthName = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  document.getElementById('obligationsMonth').textContent = monthName;
+  
+  // Categorize accounts (loan type detection handled by detectLoanType helper)
+  let creditCardDue = 0;       // Credit card statement balances due
+  let creditCardMinDue = 0;     // Credit card minimum payments
+  let loanPayments = 0;         // Loan minimum/monthly payments
+  let creditCardItems = [];
+  let loanItems = [];
+  
+  state.accounts.forEach(a => {
+    const bal = Math.abs(Number(a.balance || 0));
+    
+    // Detect loan type first (HELOC, mortgage, etc.) - this takes priority
+    const loanType = detectLoanType(a);
+    const isLoan = loanType !== null;
+    
+    // Credit card: only if NOT a loan AND type/subtype indicates credit card
+    const rawType = a.user_type || a.subtype || a.type;
+    const isCreditCard = !isLoan && (rawType === 'credit' || a.type === 'credit');
+    
+    if(isCreditCard && bal > 1){
+      // What's due: statement balance (manual or plaid) or current balance
+      const dueAmt = Number(a.dueAmount || 0) > 0 ? Number(a.dueAmount) : bal;
+      const minPay = Number(a.minPayment || 0);
+      const dueDate = a.dueDate;
+      
+      // Only count if due date falls in current month, OR no due date (estimate it's monthly)
+      let countsThisMonth = true;
+      if(dueDate){
+        const dd = new Date(dueDate + (dueDate.length === 10 ? 'T00:00:00' : ''));
+        countsThisMonth = dd >= monthStart && dd <= monthEnd;
+      }
+      
+      if(countsThisMonth && !isPaidForCycle(a)){
+        creditCardDue += dueAmt;
+        creditCardMinDue += minPay > 0 ? minPay : dueAmt;
+        creditCardItems.push({ name: a.displayName || a.name, amount: dueAmt, min: minPay, dueDate, owner: a.owner });
+      }
+    }
+    
+    if(isLoan && bal > 1){
+      // Loan monthly payment priority:
+      // 1. Manual minPayment (manual_min_payment) - user's fixed monthly payment
+      // 2. Manual dueAmount (manual_due_amount) - e.g. HELOC current statement amount
+      // 3. For loans paid FROM a linked account: detect this month's payment by
+      //    matching transactions to THIS SPECIFIC account only (no generic keywords)
+      let monthlyPay = Number(a.minPayment || 0) > 0 
+        ? Number(a.minPayment) 
+        : Number(a.dueAmount || 0);
+      let amountSource = monthlyPay > 0 ? 'manual' : 'none';
+      
+      // For loans without a manual amount, try to find THIS month's payment
+      // from transactions - but ONLY exact account-name matches (precise, no cross-match)
+      if(monthlyPay <= 0){
+        const detected = detectThisMonthLoanPayment(a, monthStart, monthEnd);
+        if(detected > 0){
+          monthlyPay = detected;
+          amountSource = 'detected';
+        }
+      }
+      
+      // Always include the loan - even if payment amount not set yet
+      loanPayments += monthlyPay;
+      loanItems.push({ 
+        name: a.displayName || a.name, 
+        amount: monthlyPay, 
+        dueDate: a.dueDate, 
+        owner: a.owner, 
+        type: loanType,
+        needsSetup: monthlyPay <= 0,
+        amountSource,
+        isHeloc: loanType === 'heloc',
+        balance: bal,
+        accountId: a.id
+      });
+    }
+  });
+  
+  const totalMonthly = creditCardDue + loanPayments;
+  const totalMinMonthly = creditCardMinDue + loanPayments;
+  
+  // Hide card if nothing to show
+  if(creditCardItems.length === 0 && loanItems.length === 0){
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = 'block';
+  
+  const typeEmoji = {
+    heloc: '🏡', mortgage: '🏠', student_loan: '🎓', auto: '🔄', loan: '📋'
+  };
+  
+  let html = `
+    <div style="background:linear-gradient(135deg,rgba(212,175,55,0.12),rgba(212,175,55,0.04));border:1px solid rgba(212,175,55,0.25);border-radius:14px;padding:16px;margin-bottom:14px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start">
+        <div>
+          <div style="font-size:11px;color:var(--text-muted);letter-spacing:1px;font-weight:600">TOTAL DUE THIS MONTH</div>
+          <div style="font-size:32px;font-weight:700;color:var(--gold);font-family:'Fraunces',Georgia,serif;margin-top:4px">${fmt(totalMonthly)}</div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-size:10px;color:var(--text-muted)">MINIMUM</div>
+          <div style="font-size:18px;font-weight:600;color:var(--text-secondary);margin-top:2px">${fmt(totalMinMonthly)}</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <div style="flex:1;background:rgba(10,14,39,0.4);border-radius:8px;padding:10px">
+          <div style="font-size:10px;color:var(--text-muted)">💳 Credit Cards</div>
+          <div style="font-size:16px;font-weight:600;margin-top:2px">${fmt(creditCardDue)}</div>
+        </div>
+        <div style="flex:1;background:rgba(10,14,39,0.4);border-radius:8px;padding:10px">
+          <div style="font-size:10px;color:var(--text-muted)">🏠 Loans</div>
+          <div style="font-size:16px;font-weight:600;margin-top:2px">${fmt(loanPayments)}</div>
+        </div>
+      </div>
+    </div>
+  `;
+  
+  // Loan breakdown
+  if(loanItems.length > 0){
+    html += `<div style="font-size:11px;color:var(--text-muted);font-weight:600;letter-spacing:0.5px;margin:14px 0 8px">RECURRING LOAN PAYMENTS</div>`;
+    loanItems.sort((a,b) => b.amount - a.amount).forEach(l => {
+      const emoji = typeEmoji[l.type] || '📋';
+      const ownerTag = l.owner === 'wife' ? ' <span class="account-owner wife">Wife</span>' : (l.owner === 'business' ? ' <span class="account-owner">Biz</span>' : '');
+      const dueStr = l.dueDate ? ` • Due ${formatDueDate(l.dueDate)}` : '';
+      
+      let subText, amountDisplay, amountColor;
+      if(l.needsSetup){
+        // No payment amount known - prompt user to set it
+        if(l.isHeloc){
+          subText = `<span style="color:var(--amber)">⚠️ Tap to enter this month's payment from statement</span>`;
+        } else {
+          subText = `<span style="color:var(--amber)">⚠️ Tap to set monthly payment</span>`;
+        }
+        amountDisplay = 'Set →';
+        amountColor = 'var(--amber)';
+      } else if(l.amountSource === 'detected'){
+        // Auto-detected from THIS account's transactions this month
+        subText = `<span style="color:var(--text-muted)">📊 Detected from this month's activity${dueStr}</span>`;
+        amountDisplay = fmt(l.amount);
+        amountColor = 'var(--gold)';
+      } else if(l.isHeloc){
+        // HELOC with manually entered amount
+        subText = `This month's payment${dueStr}`;
+        amountDisplay = fmt(l.amount);
+        amountColor = 'var(--gold)';
+      } else {
+        // Manually entered fixed amount
+        subText = `Monthly payment${dueStr}`;
+        amountDisplay = fmt(l.amount);
+        amountColor = 'var(--gold)';
+      }
+      
+      html += `
+        <div onclick="openManualAccountModalById('${l.accountId}')" style="display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:rgba(10,14,39,0.3);border-radius:8px;margin-bottom:6px;cursor:pointer">
+          <div>
+            <div style="font-size:13px;font-weight:500">${emoji} ${l.name}${ownerTag}</div>
+            <div style="font-size:10px">${subText}</div>
+          </div>
+          <div style="font-size:14px;font-weight:600;color:${amountColor}">${amountDisplay}</div>
+        </div>
+      `;
+    });
+  }
+  
+  // Credit card breakdown
+  if(creditCardItems.length > 0){
+    html += `<div style="font-size:11px;color:var(--text-muted);font-weight:600;letter-spacing:0.5px;margin:14px 0 8px">CREDIT CARD BILLS</div>`;
+    creditCardItems.sort((a,b) => b.amount - a.amount).forEach(c => {
+      const ownerTag = c.owner === 'wife' ? ' <span class="account-owner wife">Wife</span>' : '';
+      const dueStr = c.dueDate ? ` • Due ${formatDueDate(c.dueDate)}` : ' • No due date set';
+      const minStr = c.min > 0 ? `Min ${fmt(c.min)}` : 'Statement balance';
+      html += `
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:rgba(10,14,39,0.3);border-radius:8px;margin-bottom:6px">
+          <div>
+            <div style="font-size:13px;font-weight:500">💳 ${c.name}${ownerTag}</div>
+            <div style="font-size:10px;color:var(--text-muted)">${minStr}${dueStr}</div>
+          </div>
+          <div style="font-size:14px;font-weight:600;color:var(--gold)">${fmt(c.amount)}</div>
+        </div>
+      `;
+    });
+  }
+  
+  html += `
+    <div style="font-size:10px;color:var(--text-muted);text-align:center;margin-top:10px;line-height:1.5">
+      💡 Tap any loan or card to set its monthly payment or due date. Amounts shown are what you've entered.
+    </div>
+  `;
+  
+  breakdown.innerHTML = html;
+}
+
+let chartInstance = null;
+function renderMonthChart(mt){
+  const days = {};
+  mt.forEach(t => {
+    if(t.type === 'business' || t.type === 'transfer') return;
+    if(!days[t.date]) days[t.date] = { in:0, out:0 };
+    if(t.amount > 0) days[t.date].in += t.amount; else days[t.date].out += Math.abs(t.amount);
+  });
+  const sd = Object.keys(days).sort();
+  const ctx = document.getElementById('monthChart');
+  if(!ctx) return;
+  if(chartInstance) chartInstance.destroy();
+  chartInstance = new Chart(ctx, {
+    type:'bar',
+    data:{ labels:sd.map(d => new Date(d).getDate()),
+      datasets:[
+        { label:'Income', data:sd.map(d => days[d].in), backgroundColor:'rgba(74,222,128,0.7)', borderRadius:4 },
+        { label:'Expenses', data:sd.map(d => -days[d].out), backgroundColor:'rgba(248,113,113,0.6)', borderRadius:4 }
+      ]},
+    options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{ display:false } },
+      scales:{ x:{ grid:{ display:false }, ticks:{ color:'#6b6e8a', font:{ size:10 } } },
+        y:{ grid:{ color:'rgba(255,255,255,0.04)' }, ticks:{ color:'#6b6e8a', font:{ size:10 }, callback: v => '$' + Math.abs(v) } } }
+    }
+  });
+}
+
+function renderAccounts(){
+  const list = document.getElementById('accountsList');
+  document.getElementById('accountCount').textContent = state.accounts.length + ' linked';
+  if(state.accounts.length === 0){
+    list.innerHTML = `<div class="empty-state"><div class="empty-icon">🏦</div><div class="empty-title">No accounts linked yet</div><div class="empty-sub">Connect your first bank or credit card below</div></div>`;
+    return;
+  }
+  
+  // Group accounts by type
+  const groups = {};
+  state.accounts.forEach(a => {
+    const g = getAccountGroup(a);
+    if(!groups[g]) groups[g] = { accounts:[], total:0, config: GROUP_CONFIG[g] };
+    groups[g].accounts.push(a);
+    groups[g].total += Math.abs(Number(a.balance || 0));
+  });
+  
+  const sortedGroups = Object.entries(groups).sort((a,b) => a[1].config.order - b[1].config.order);
+  
+  list.innerHTML = '';
+  sortedGroups.forEach(([key, g]) => {
+    // Group header with subtotal
+    const header = document.createElement('div');
+    header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:14px 0 8px;margin-top:8px;border-bottom:1px solid var(--border);';
+    const valueColor = g.config.isAsset ? 'var(--text-primary)' : 'var(--red)';
+    const valuePrefix = g.config.isAsset ? '' : '-';
+    header.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-size:18px">${g.config.icon}</span>
+        <span style="font-family:'Fraunces',serif;font-size:16px;font-weight:600;color:var(--gold)">${g.config.label}</span>
+        <span style="color:var(--text-muted);font-size:11px">(${g.accounts.length})</span>
+      </div>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:15px;font-weight:600;color:${valueColor}">${valuePrefix}${fmt(g.total)}</div>
+    `;
+    list.appendChild(header);
+    
+    // Each account in this group
+    g.accounts.forEach(a => {
+      const dispName = a.displayName || a.name;
+      const dispInst = a.displayInstitution || a.institution || '';
+      const initial = (dispInst || dispName).charAt(0);
+      const ob = a.owner === 'wife' ? '<span class="account-owner wife">Wife</span>' : (a.owner === 'business' ? '<span class="account-owner">Business</span>' : '');
+      const manualBadge = a.is_manual ? '<span style="font-size:9px;color:var(--gold);background:rgba(212,175,55,0.15);padding:2px 6px;border-radius:4px;margin-left:4px;font-weight:600">MANUAL</span>' : '';
+      const item = document.createElement('div');
+      item.className = 'account-item';
+      item.style.cursor = 'pointer';
+      item.onclick = () => openAccountModal(a);
+      const balDisplay = g.config.isAsset ? Math.abs(Number(a.balance)) : -Math.abs(Number(a.balance));
+      const balColor = g.config.isAsset ? 'var(--text-primary)' : 'var(--red)';
+      // Last updated: manual accounts show when user last edited; Plaid accounts show last sync
+      const updatedText = a.is_manual 
+        ? `✏️ Manual • ${formatLastUpdated(a.updated_at)}` 
+        : formatLastUpdated(a.updated_at);
+      item.innerHTML = `
+        <div class="account-icon">${initial}</div>
+        <div class="account-info">
+          <div class="account-name">${dispName} ${ob}${manualBadge}</div>
+          <div class="account-type">${dispInst} • ${a.subtype || a.type}</div>
+          <div style="font-size:9px;color:var(--text-muted);margin-top:2px;opacity:0.7">${updatedText}</div>
+        </div>
+        <div class="account-balance" style="color:${balColor}">${fmt(balDisplay)}</div>`;
+      list.appendChild(item);
+    });
+  });
+}
+
+// =============================================================
+// MANUAL ACCOUNT MANAGEMENT
+// For loans, mortgages, and accounts not in Plaid
+// =============================================================
+
+// Open manual account modal by account ID (used from Monthly Obligations card)
+function openManualAccountModalById(accountId){
+  console.log('[openManualAccountModalById] Called with ID:', accountId);
+  const account = state.accounts.find(a => a.id === accountId);
+  if(!account){
+    console.error('[openManualAccountModalById] Account not found:', accountId);
+    showToast('Account not found');
+    return;
+  }
+  console.log('[openManualAccountModalById] Found account:', account.name, 'is_manual:', account.is_manual);
+  try {
+    if(account.is_manual){
+      openManualAccountModal(account);
+    } else {
+      // Plaid account - open the regular account modal
+      openAccountModal(account);
+    }
+  } catch(e){
+    console.error('[openManualAccountModalById] Error opening modal:', e);
+    showToast('Error opening account: ' + e.message);
+  }
+}
+
+function openManualAccountModal(existingAccount = null){
+  const modal = document.getElementById('manualAcctModal');
+  const title = document.getElementById('manualAcctTitle');
+  const deleteBtn = document.getElementById('deleteManualAcctBtn');
+  
+  if(existingAccount){
+    // Edit mode
+    title.textContent = 'Edit Manual Account';
+    state.currentAccount = existingAccount;
+    document.getElementById('manualName').value = existingAccount.name || '';
+    document.getElementById('manualInstitution').value = existingAccount.institution || '';
+    document.getElementById('manualType').value = existingAccount.user_type || existingAccount.subtype || existingAccount.type || 'other';
+    document.getElementById('manualBalance').value = Math.abs(Number(existingAccount.balance || 0));
+    document.getElementById('manualOwner').value = existingAccount.owner || 'self';
+    document.getElementById('manualNextDue').value = existingAccount.manual_due_date || existingAccount.due_date || '';
+    document.getElementById('manualPayAmount').value = existingAccount.manual_due_amount || existingAccount.due_amount || '';
+    document.getElementById('manualMinPay').value = existingAccount.manual_min_payment || existingAccount.min_payment || '';
+    document.getElementById('manualPayUrl').value = existingAccount.pay_url || '';
+    document.getElementById('manualNotes').value = existingAccount.notes || '';
+    deleteBtn.style.display = 'block';
+  } else {
+    // Add mode - clear all fields
+    title.textContent = 'Add Manual Account';
+    state.currentAccount = null;
+    document.getElementById('manualName').value = '';
+    document.getElementById('manualInstitution').value = '';
+    document.getElementById('manualType').value = 'loan';
+    document.getElementById('manualBalance').value = '';
+    document.getElementById('manualOwner').value = 'self';
+    document.getElementById('manualNextDue').value = '';
+    document.getElementById('manualPayAmount').value = '';
+    document.getElementById('manualMinPay').value = '';
+    document.getElementById('manualPayUrl').value = '';
+    document.getElementById('manualNotes').value = '';
+    deleteBtn.style.display = 'none';
+  }
+  
+  modal.classList.add('active');
+}
+
+function closeManualAccountModal(){
+  document.getElementById('manualAcctModal').classList.remove('active');
+  state.currentAccount = null;
+}
+
+async function saveManualAccount(){
+  const name = document.getElementById('manualName').value.trim();
+  const institution = document.getElementById('manualInstitution').value.trim();
+  const type = document.getElementById('manualType').value;
+  const balanceInput = parseFloat(document.getElementById('manualBalance').value);
+  const owner = document.getElementById('manualOwner').value;
+  const nextDue = document.getElementById('manualNextDue').value || null;
+  const payAmount = document.getElementById('manualPayAmount').value ? parseFloat(document.getElementById('manualPayAmount').value) : null;
+  const minPay = document.getElementById('manualMinPay').value ? parseFloat(document.getElementById('manualMinPay').value) : null;
+  const payUrl = document.getElementById('manualPayUrl').value.trim() || null;
+  const notes = document.getElementById('manualNotes').value.trim() || null;
+  
+  if(!name || !institution || isNaN(balanceInput)){
+    showToast('Name, Institution, and Balance are required');
+    return;
+  }
+  
+  // Determine if liability or asset based on type
+  const liabilityTypes = ['credit', 'heloc', 'mortgage', 'student_loan', 'auto', 'loan'];
+  const isLiability = liabilityTypes.includes(type);
+  // Store balance: positive for assets, negative for liabilities
+  const balance = isLiability ? -Math.abs(balanceInput) : Math.abs(balanceInput);
+  
+  if(state.isDemo){
+    showToast('Demo mode — changes not saved');
+    closeManualAccountModal();
+    return;
+  }
+  
+  if(!state.supabase || !state.user){
+    showToast('Not authenticated');
+    return;
+  }
+  
+  try {
+    const accountData = {
+      user_id: state.user.id,
+      name: name,
+      institution: institution,
+      type: isLiability ? 'loan' : 'depository',
+      subtype: type,
+      user_type: type,
+      balance: balance,
+      available: null,
+      owner: owner,
+      is_manual: true,
+      manual_due_date: nextDue,
+      manual_due_amount: payAmount,
+      manual_min_payment: minPay,
+      pay_url: payUrl,
+      notes: notes,
+      item_id: null  // No Plaid item
+    };
+    
+    if(state.currentAccount){
+      // Update existing
+      const { error } = await state.supabase
+        .from('accounts')
+        .update(accountData)
+        .eq('id', state.currentAccount.id);
+      if(error) throw error;
+      showToast('Account updated!');
+    } else {
+      // Insert new - generate ID
+      accountData.id = 'manual_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+      const { error } = await state.supabase
+        .from('accounts')
+        .insert(accountData);
+      if(error) throw error;
+      showToast('Manual account added!');
+    }
+    
+    await loadUserData();
+    closeManualAccountModal();
+  } catch(e){
+    showToast('Save failed: ' + e.message);
+    console.error('Manual account save error:', e);
+  }
+}
+
+async function deleteManualAccount(){
+  if(!state.currentAccount) return;
+  
+  const confirm = window.confirm(
+    `Delete "${state.currentAccount.name}"?\n\n` +
+    `This will permanently remove this account from your records.\n` +
+    `Any transactions tied to it will also be removed.\n\n` +
+    `This cannot be undone.`
+  );
+  if(!confirm) return;
+  
+  try {
+    // Delete transactions tied to this account first
+    await state.supabase
+      .from('transactions')
+      .delete()
+      .eq('account_id', state.currentAccount.id);
+    
+    // Delete the account
+    const { error } = await state.supabase
+      .from('accounts')
+      .delete()
+      .eq('id', state.currentAccount.id);
+    
+    if(error) throw error;
+    
+    showToast('Account deleted');
+    await loadUserData();
+    closeManualAccountModal();
+  } catch(e){
+    showToast('Delete failed: ' + e.message);
+  }
+}
+
+// Modal for editing account owner classification
+function openAccountModal(a){
+  // If it's a manual account, open manual editor instead
+  if(a.is_manual){
+    openManualAccountModal(a);
+    return;
+  }
+  
+  console.log('[openAccountModal] Opening for:', a.name);
+  state.currentAccount = a;
+  const modal = document.getElementById('accountModal');
+  if(!modal){
+    console.error('[openAccountModal] accountModal element not found!');
+    showToast('Modal not found');
+    return;
+  }
+  
+  // Helper: safely set text content
+  const setText = (id, text) => {
+    const el = document.getElementById(id);
+    if(el) el.textContent = text;
+    else console.warn('[openAccountModal] Missing element:', id);
+  };
+  const setValue = (id, val) => {
+    const el = document.getElementById(id);
+    if(el) el.value = val;
+    else console.warn('[openAccountModal] Missing input:', id);
+  };
+  
+  // Show CURRENT display name (custom or original)
+  const displayName = a.custom_name || a.name;
+  const displayInst = a.custom_institution || a.institution || '';
+  setText('acctModalName', displayName);
+  setText('acctModalInst', displayInst + ' • ' + (a.subtype || a.type));
+  setText('acctModalBalance', fmt(Number(a.balance)));
+  
+  // Populate rename inputs
+  setValue('customAccountName', a.custom_name || '');
+  setValue('customInstName', a.custom_institution || '');
+  setText('originalAcctName', 'Original: ' + (a.name || '—'));
+  setText('originalInstName', 'Original: ' + (a.institution || '—'));
+  
+  // Set active owner button
+  document.querySelectorAll('.acct-owner-btn').forEach(b => b.classList.remove('active'));
+  document.querySelector(`.acct-owner-btn[data-owner="${a.owner || 'self'}"]`)?.classList.add('active');
+  
+  // Set active type button
+  document.querySelectorAll('.acct-type-btn').forEach(b => b.classList.remove('active'));
+  const currentType = a.user_type || getAccountGroup({...a, user_type: null});
+  document.querySelector(`.acct-type-btn[data-type="${currentType}"]`)?.classList.add('active');
+  
+  // Show auto-detected type for reference
+  const autoType = getAccountGroup({...a, user_type: null});
+  const autoConfig = GROUP_CONFIG[autoType];
+  setText('acctAutoType', autoConfig ? `${autoConfig.icon} ${autoConfig.label}` : autoType);
+  
+  // Show manual payment section for credit cards AND loans (HELOC, mortgage, etc.)
+  const loanTypeSet = ['heloc', 'mortgage', 'student_loan', 'auto', 'loan'];
+  const isCredit = currentType === 'credit';
+  const isLoanType = loanTypeSet.includes(currentType);
+  const showManualSection = isCredit || isLoanType;
+  const manualSection = document.getElementById('manualDueSection');
+  if(manualSection) manualSection.style.display = showManualSection ? 'block' : 'none';
+  
+  // Customize labels based on account type
+  if(isLoanType){
+    const loanLabels = {
+      heloc: '🏡 HELOC Payment Info',
+      mortgage: '🏠 Mortgage Payment Info',
+      student_loan: '🎓 Student Loan Payment Info',
+      auto: '🔄 Auto Loan Payment Info',
+      loan: '📋 Loan Payment Info'
+    };
+    setText('manualDueSectionTitle', loanLabels[currentType] || '📋 Loan Payment Info');
+    if(currentType === 'heloc'){
+      setText('manualDueSectionHint', 
+        'HELOC payments change every month based on your balance & interest. Enter the CURRENT amount due from your latest statement — update it monthly when your new statement arrives.');
+      setText('manualMinPaymentLabel', 'This Month\'s Payment ($) — from your latest statement');
+    } else {
+      setText('manualDueSectionHint', 
+        'Enter your monthly payment amount and next due date.');
+      setText('manualMinPaymentLabel', 'Monthly Payment ($) — your fixed monthly payment');
+    }
+    setText('manualDueAmountLabel', 'Total Statement Balance ($) — optional');
+    setText('manualDueDateLabel', 'Next Due Date');
+  } else if(isCredit){
+    setText('manualDueSectionTitle', '💳 Manual Payment Info (Override Plaid)');
+    setText('manualDueSectionHint', 
+      'Agar Plaid se due date nahi mil rahi (Robinhood, etc.) ya galat aa rahi hai, yahan manually daalo.');
+    setText('manualMinPaymentLabel', 'Minimum Payment ($)');
+    setText('manualDueAmountLabel', 'Statement / Total Due ($)');
+    setText('manualDueDateLabel', 'Due Date');
+  }
+  
+  // Populate manual fields if they exist
+  setValue('manualDueDate', a.manual_due_date || '');
+  setValue('manualDueAmount', a.manual_due_amount || '');
+  setValue('manualMinPayment', a.manual_min_payment || '');
+  
+  modal.classList.add('active');
+  console.log('[openAccountModal] Modal opened, active class added');
+}
+
+function clearCustomNames(){
+  document.getElementById('customAccountName').value = '';
+  document.getElementById('customInstName').value = '';
+}
+
+function closeAccountModal(){
+  document.getElementById('accountModal').classList.remove('active');
+  state.currentAccount = null;
+}
+
+function setAccountOwner(owner){
+  document.querySelectorAll('.acct-owner-btn').forEach(b => b.classList.remove('active'));
+  document.querySelector(`.acct-owner-btn[data-owner="${owner}"]`)?.classList.add('active');
+}
+
+function setAccountType(t){
+  document.querySelectorAll('.acct-type-btn').forEach(b => b.classList.remove('active'));
+  document.querySelector(`.acct-type-btn[data-type="${t}"]`)?.classList.add('active');
+  // Show/hide manual due date section based on type
+  document.getElementById('manualDueSection').style.display = t === 'credit' ? 'block' : 'none';
+}
+
+function clearManualDue(){
+  document.getElementById('manualDueDate').value = '';
+  document.getElementById('manualDueAmount').value = '';
+  document.getElementById('manualMinPayment').value = '';
+}
+
+async function saveAccountChanges(){
+  if(!state.currentAccount) return;
+  const newOwner = document.querySelector('.acct-owner-btn.active')?.dataset.owner || 'self';
+  const newType = document.querySelector('.acct-type-btn.active')?.dataset.type || null;
+  
+  // Only set user_type if it differs from auto-detection
+  const autoType = getAccountGroup({...state.currentAccount, user_type: null});
+  const userTypeOverride = (newType && newType !== autoType) ? newType : null;
+  
+  // Get manual due date entries (if credit card)
+  const manualDueDate = document.getElementById('manualDueDate').value || null;
+  const manualDueAmount = document.getElementById('manualDueAmount').value ? parseFloat(document.getElementById('manualDueAmount').value) : null;
+  const manualMinPayment = document.getElementById('manualMinPayment').value ? parseFloat(document.getElementById('manualMinPayment').value) : null;
+  
+  // Get custom display names
+  const customAcctName = document.getElementById('customAccountName').value.trim() || null;
+  const customInstName = document.getElementById('customInstName').value.trim() || null;
+  
+  if(!state.isDemo && state.supabase){
+    // Update this account
+    await state.supabase.from('accounts').update({ 
+      owner: newOwner,
+      user_type: userTypeOverride,
+      manual_due_date: manualDueDate,
+      manual_due_amount: manualDueAmount,
+      manual_min_payment: manualMinPayment,
+      custom_name: customAcctName,
+      custom_institution: customInstName
+    }).eq('id', state.currentAccount.id);
+    
+    // If institution name changed, apply to ALL accounts at the same original institution
+    const originalInstitution = state.currentAccount.institution;
+    if(originalInstitution && customInstName !== state.currentAccount.custom_institution){
+      await state.supabase.from('accounts')
+        .update({ custom_institution: customInstName })
+        .eq('user_id', state.user.id)
+        .eq('institution', originalInstitution);
+    }
+  }
+  
+  // Reload data to refresh display
+  await loadUserData();
+  closeAccountModal();
+  showToast('Account updated!');
+}
+
+// =============================================================
+// FILTER FUNCTIONS - Date, Account, Amount, Search
+// =============================================================
+
+function getDateRange(rangeKey){
+  const now = new Date();
+  let from = null, to = null;
+  
+  if(rangeKey === 'today'){
+    from = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    to = new Date(from); to.setHours(23, 59, 59);
+  } else if(rangeKey === 'this_week'){
+    from = new Date(now); from.setDate(now.getDate() - now.getDay());
+    from.setHours(0,0,0,0);
+    to = new Date(now);
+  } else if(rangeKey === 'this_month'){
+    from = new Date(now.getFullYear(), now.getMonth(), 1);
+    to = new Date(now);
+  } else if(rangeKey === 'last_month'){
+    from = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    to = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59);
+  } else if(rangeKey === 'last_3_months'){
+    from = new Date(now.getFullYear(), now.getMonth() - 3, 1);
+    to = new Date(now);
+  } else if(rangeKey === 'ytd' || rangeKey === 'this_year'){
+    from = new Date(now.getFullYear(), 0, 1);
+    to = new Date(now);
+  } else if(rangeKey === 'last_year'){
+    from = new Date(now.getFullYear() - 1, 0, 1);
+    to = new Date(now.getFullYear() - 1, 11, 31, 23, 59, 59);
+  } else if(rangeKey === 'all'){
+    from = null; to = null;
+  } else if(rangeKey === 'custom'){
+    from = state.filterDateFrom ? new Date(state.filterDateFrom + 'T00:00:00') : null;
+    to = state.filterDateTo ? new Date(state.filterDateTo + 'T23:59:59') : null;
+  }
+  return { from, to };
+}
+
+function setDateRange(key){
+  state.filterDateRange = key;
+  document.querySelectorAll('.date-chip').forEach(b => b.classList.remove('active'));
+  document.querySelector(`.date-chip[data-date="${key}"]`)?.classList.add('active');
+  // Sync inline date pickers with chosen preset
+  const range = getDateRange(key);
+  const fromInput = document.getElementById('inlineDateFrom');
+  const toInput = document.getElementById('inlineDateTo');
+  if(fromInput && toInput){
+    fromInput.value = range.from ? range.from.toISOString().slice(0,10) : '';
+    toInput.value = range.to ? range.to.toISOString().slice(0,10) : '';
+  }
+  // Update label
+  const label = document.getElementById('dateRangeLabel');
+  if(label){
+    const labels = {
+      today: 'Today',
+      this_week: 'This Week',
+      this_month: 'This Month',
+      last_month: 'Last Month',
+      last_3_months: 'Last 3 Months',
+      ytd: 'Year to Date',
+      this_year: 'Year to Date',
+      last_year: 'Last Year',
+      all: 'All Time',
+      custom: 'Custom Range'
+    };
+    label.textContent = labels[key] || 'Custom Range';
+  }
+  renderTransactions();
+}
+
+// When user manually changes inline date pickers
+function onInlineDateChange(){
+  const from = document.getElementById('inlineDateFrom').value;
+  const to = document.getElementById('inlineDateTo').value;
+  
+  // If user clears one, treat as "all" if both empty
+  if(!from && !to){
+    setDateRange('all');
+    return;
+  }
+  
+  if(from && to && new Date(from) > new Date(to)){
+    showToast('From date must be before To date');
+    return;
+  }
+  
+  state.filterDateFrom = from || null;
+  state.filterDateTo = to || null;
+  state.filterDateRange = 'custom';
+  
+  // Deactivate all preset chips
+  document.querySelectorAll('.date-chip').forEach(b => b.classList.remove('active'));
+  
+  // Update label
+  const label = document.getElementById('dateRangeLabel');
+  if(label){
+    if(from && to){
+      label.textContent = `${formatShortDate(from)} - ${formatShortDate(to)}`;
+    } else if(from){
+      label.textContent = `From ${formatShortDate(from)}`;
+    } else if(to){
+      label.textContent = `Until ${formatShortDate(to)}`;
+    }
+  }
+  
+  renderTransactions();
+}
+
+function formatShortDate(d){
+  if(!d) return '';
+  const date = new Date(d + 'T00:00:00');
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function openAccountFilterModal(){
+  const list = document.getElementById('acctFilterList');
+  list.innerHTML = '';
+  state.accounts.forEach(a => {
+    const checked = state.filterAccounts.has(a.id) ? 'checked' : '';
+    const owner = a.owner === 'wife' ? ' • Wife' : (a.owner === 'business' ? ' • Business' : '');
+    const dispName = a.displayName || a.name;
+    const dispInst = a.displayInstitution || a.institution || '';
+    const div = document.createElement('div');
+    div.style.cssText = 'display:flex;align-items:center;gap:12px;padding:10px;border-bottom:1px solid var(--border-soft);cursor:pointer';
+    div.innerHTML = `
+      <input type="checkbox" id="acct-${a.id}" data-id="${a.id}" ${checked} style="width:18px;height:18px;cursor:pointer">
+      <label for="acct-${a.id}" style="flex:1;cursor:pointer">
+        <div style="font-size:13px;font-weight:500">${dispName}${owner}</div>
+        <div style="font-size:11px;color:var(--text-muted)">${dispInst} • ${a.subtype || a.type}</div>
+      </label>
+    `;
+    list.appendChild(div);
+  });
+  document.getElementById('acctFilterModal').classList.add('active');
+}
+
+function closeAcctFilterModal(){
+  document.getElementById('acctFilterModal').classList.remove('active');
+}
+
+function selectAllAccounts(){
+  document.querySelectorAll('#acctFilterList input[type="checkbox"]').forEach(cb => cb.checked = true);
+}
+
+function clearAccountFilter(){
+  document.querySelectorAll('#acctFilterList input[type="checkbox"]').forEach(cb => cb.checked = false);
+}
+
+function applyAccountFilter(){
+  state.filterAccounts = new Set();
+  document.querySelectorAll('#acctFilterList input[type="checkbox"]:checked').forEach(cb => {
+    state.filterAccounts.add(cb.dataset.id);
+  });
+  // Update button label
+  const btn = document.getElementById('acctFilterBtn');
+  if(state.filterAccounts.size === 0 || state.filterAccounts.size === state.accounts.length){
+    btn.textContent = '🏦 All Accounts';
+    btn.style.color = '';
+    btn.style.borderColor = '';
+    state.filterAccounts = new Set(); // normalize
+  } else {
+    btn.textContent = `🏦 ${state.filterAccounts.size} Account${state.filterAccounts.size > 1 ? 's' : ''}`;
+    btn.style.color = 'var(--gold)';
+    btn.style.borderColor = 'var(--gold)';
+  }
+  closeAcctFilterModal();
+  renderTransactions();
+}
+
+// =============================================================
+// INSTITUTION FILTER (group of accounts by bank)
+// =============================================================
+function getInstitutions(){
+  const insts = {};
+  state.accounts.forEach(a => {
+    // Use display institution (custom rename if set)
+    const key = a.displayInstitution || a.institution || 'Unknown';
+    if(!insts[key]) insts[key] = { name: key, count: 0, accountIds: [] };
+    insts[key].count++;
+    insts[key].accountIds.push(a.id);
+  });
+  return Object.values(insts).sort((a,b) => a.name.localeCompare(b.name));
+}
+
+function openInstitutionFilterModal(){
+  const list = document.getElementById('instFilterList');
+  list.innerHTML = '';
+  const institutions = getInstitutions();
+  
+  if(institutions.length === 0){
+    list.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);font-size:13px">No banks linked yet</div>';
+  }
+  
+  institutions.forEach(inst => {
+    const checked = state.filterInstitutions.has(inst.name) ? 'checked' : '';
+    const initial = inst.name.charAt(0).toUpperCase();
+    const div = document.createElement('div');
+    div.style.cssText = 'display:flex;align-items:center;gap:12px;padding:12px;border-bottom:1px solid var(--border-soft);cursor:pointer';
+    div.innerHTML = `
+      <input type="checkbox" id="inst-${inst.name.replace(/\s/g,'')}" data-name="${inst.name}" ${checked} style="width:18px;height:18px;cursor:pointer">
+      <div style="width:32px;height:32px;border-radius:8px;background:var(--gold-soft);display:flex;align-items:center;justify-content:center;font-weight:700;color:var(--gold);font-family:'Fraunces',serif;font-size:14px">${initial}</div>
+      <label for="inst-${inst.name.replace(/\s/g,'')}" style="flex:1;cursor:pointer">
+        <div style="font-size:14px;font-weight:500">${inst.name}</div>
+        <div style="font-size:11px;color:var(--text-muted)">${inst.count} account${inst.count > 1 ? 's' : ''}</div>
+      </label>
+    `;
+    list.appendChild(div);
+  });
+  document.getElementById('instFilterModal').classList.add('active');
+}
+
+function closeInstFilterModal(){
+  document.getElementById('instFilterModal').classList.remove('active');
+}
+
+function selectAllInstitutions(){
+  document.querySelectorAll('#instFilterList input[type="checkbox"]').forEach(cb => cb.checked = true);
+}
+
+function clearInstitutionFilter(){
+  document.querySelectorAll('#instFilterList input[type="checkbox"]').forEach(cb => cb.checked = false);
+}
+
+function applyInstitutionFilter(){
+  state.filterInstitutions = new Set();
+  document.querySelectorAll('#instFilterList input[type="checkbox"]:checked').forEach(cb => {
+    state.filterInstitutions.add(cb.dataset.name);
+  });
+  const btn = document.getElementById('instFilterBtn');
+  const total = getInstitutions().length;
+  if(state.filterInstitutions.size === 0 || state.filterInstitutions.size === total){
+    btn.textContent = '🏛️ All Banks';
+    btn.style.color = '';
+    btn.style.borderColor = '';
+    state.filterInstitutions = new Set();
+  } else if(state.filterInstitutions.size === 1){
+    const name = Array.from(state.filterInstitutions)[0];
+    const shortName = name.length > 12 ? name.slice(0,12) + '…' : name;
+    btn.textContent = `🏛️ ${shortName}`;
+    btn.style.color = 'var(--gold)';
+    btn.style.borderColor = 'var(--gold)';
+  } else {
+    btn.textContent = `🏛️ ${state.filterInstitutions.size} Banks`;
+    btn.style.color = 'var(--gold)';
+    btn.style.borderColor = 'var(--gold)';
+  }
+  closeInstFilterModal();
+  renderTransactions();
+}
+
+function openAmountFilterModal(){
+  document.getElementById('amountMin').value = state.filterMinAmount || '';
+  document.getElementById('amountMax').value = state.filterMaxAmount || '';
+  document.getElementById('amountFilterModal').classList.add('active');
+}
+
+function closeAmountFilterModal(){
+  document.getElementById('amountFilterModal').classList.remove('active');
+}
+
+function applyAmountFilter(){
+  const minVal = document.getElementById('amountMin').value;
+  const maxVal = document.getElementById('amountMax').value;
+  state.filterMinAmount = minVal ? parseFloat(minVal) : null;
+  state.filterMaxAmount = maxVal ? parseFloat(maxVal) : null;
+  const btn = document.getElementById('amountFilterBtn');
+  if(state.filterMinAmount !== null || state.filterMaxAmount !== null){
+    btn.textContent = `💰 ${state.filterMinAmount !== null ? '$'+state.filterMinAmount : '$0'} - ${state.filterMaxAmount !== null ? '$'+state.filterMaxAmount : '∞'}`;
+    btn.style.color = 'var(--gold)';
+  } else {
+    btn.textContent = '💰 Any Amount';
+    btn.style.color = '';
+  }
+  closeAmountFilterModal();
+  renderTransactions();
+}
+
+function clearAmountFilter(){
+  state.filterMinAmount = null;
+  state.filterMaxAmount = null;
+  document.getElementById('amountMin').value = '';
+  document.getElementById('amountMax').value = '';
+  document.getElementById('amountFilterBtn').textContent = '💰 Any Amount';
+  document.getElementById('amountFilterBtn').style.color = '';
+  closeAmountFilterModal();
+  renderTransactions();
+}
+
+let searchTimeout = null;
+function onSearchChange(){
+  clearTimeout(searchTimeout);
+  searchTimeout = setTimeout(() => {
+    state.filterSearch = document.getElementById('searchInput').value.toLowerCase().trim();
+    renderTransactions();
+  }, 200);
+}
+
+// Detect likely transfers (matching opposite amounts within 2 days, between same user's accounts)
+function detectTransfers(transactions){
+  const tagged = new Set();
+  for(let i = 0; i < transactions.length; i++){
+    if(tagged.has(transactions[i].id)) continue;
+    const t1 = transactions[i];
+    if(t1.type && t1.type !== 'uncategorized') continue;
+    for(let j = i + 1; j < transactions.length; j++){
+      const t2 = transactions[j];
+      if(tagged.has(t2.id)) continue;
+      if(t2.type && t2.type !== 'uncategorized') continue;
+      // Different accounts, opposite amounts, within 3 days
+      if(t1.accountId !== t2.accountId &&
+         Math.abs(t1.amount + t2.amount) < 0.01 &&
+         Math.abs(new Date(t1.date) - new Date(t2.date)) <= 3 * 86400000){
+        // Check keywords
+        const desc1 = (t1.description || '').toLowerCase();
+        const desc2 = (t2.description || '').toLowerCase();
+        if(desc1.includes('transfer') || desc1.includes('xfer') || desc2.includes('transfer') || desc2.includes('xfer') ||
+           desc1.includes('payment') && desc2.includes('payment')){
+          tagged.add(t1.id);
+          tagged.add(t2.id);
+        }
+      }
+    }
+  }
+  return tagged;
+}
+
+function renderTransactions(){
+  const list = document.getElementById('txList');
+  
+  // Auto-detect likely transfers
+  const likelyTransfers = detectTransfers(state.transactions);
+  
+  // Start with all transactions
+  let filtered = state.transactions;
+  
+  // 1. Apply type filter
+  if(state.currentFilter === 'personal') filtered = filtered.filter(t => t.type === 'personal' || t.type === 'income');
+  else if(state.currentFilter === 'business') filtered = filtered.filter(t => t.type === 'business');
+  else if(state.currentFilter === 'income') filtered = filtered.filter(t => t.amount > 0 && t.type !== 'transfer');
+  else if(state.currentFilter === 'transfer') filtered = filtered.filter(t => t.type === 'transfer' || likelyTransfers.has(t.id));
+  else if(state.currentFilter === 'uncategorized') filtered = filtered.filter(t => (!t.type || t.type === 'uncategorized') && !likelyTransfers.has(t.id));
+  
+  // 2. Apply date range filter
+  const dateRange = getDateRange(state.filterDateRange);
+  if(dateRange.from || dateRange.to){
+    filtered = filtered.filter(t => {
+      const txDate = parseLocalDate(t.date);
+      if(!txDate) return false;
+      if(dateRange.from && txDate < dateRange.from) return false;
+      if(dateRange.to && txDate > dateRange.to) return false;
+      return true;
+    });
+  }
+  
+  // 3. Apply account filter
+  if(state.filterAccounts.size > 0){
+    filtered = filtered.filter(t => state.filterAccounts.has(t.accountId));
+  }
+  
+  // 3b. Apply institution filter (group of accounts by bank)
+  if(state.filterInstitutions.size > 0){
+    const validAccountIds = new Set();
+    state.accounts.forEach(a => {
+      const instName = a.displayInstitution || a.institution;
+      if(state.filterInstitutions.has(instName)) validAccountIds.add(a.id);
+    });
+    filtered = filtered.filter(t => validAccountIds.has(t.accountId));
+  }
+  
+  // 4. Apply amount filter (absolute value)
+  if(state.filterMinAmount !== null || state.filterMaxAmount !== null){
+    filtered = filtered.filter(t => {
+      const abs = Math.abs(t.amount);
+      if(state.filterMinAmount !== null && abs < state.filterMinAmount) return false;
+      if(state.filterMaxAmount !== null && abs > state.filterMaxAmount) return false;
+      return true;
+    });
+  }
+  
+  // 5. Apply search filter
+  if(state.filterSearch){
+    filtered = filtered.filter(t => 
+      (t.description || '').toLowerCase().includes(state.filterSearch) ||
+      (t.merchant || '').toLowerCase().includes(state.filterSearch) ||
+      (t.category || '').toLowerCase().includes(state.filterSearch)
+    );
+  }
+  
+  // Update count + summary stats
+  const totalAmount = filtered.reduce((s, t) => s + t.amount, 0);
+  const totalIncome = filtered.filter(t => t.amount > 0 && t.type !== 'transfer').reduce((s, t) => s + t.amount, 0);
+  const totalExpense = filtered.filter(t => t.amount < 0 && t.type !== 'transfer').reduce((s, t) => s + Math.abs(t.amount), 0);
+  
+  document.getElementById('txCount').textContent = filtered.length + ' items';
+  
+  // Show filter summary
+  const summaryDiv = document.getElementById('filterSummary');
+  if(filtered.length > 0){
+    summaryDiv.style.display = 'block';
+    summaryDiv.innerHTML = `
+      <div style="display:flex;justify-content:space-between;color:var(--text-secondary)">
+        <span>💚 Income: <strong style="color:var(--green)">${fmt(totalIncome)}</strong></span>
+        <span>💸 Expense: <strong style="color:var(--red)">${fmt(totalExpense)}</strong></span>
+        <span>= <strong style="color:var(--gold)">${fmt(totalIncome - totalExpense)}</strong></span>
+      </div>
+    `;
+  } else {
+    summaryDiv.style.display = 'none';
+  }
+  
+  if(filtered.length === 0){
+    list.innerHTML = `<div class="empty-state"><div class="empty-icon">📊</div><div class="empty-title">No transactions match filters</div><div class="empty-sub">Try adjusting your filters</div></div>`;
+    return;
+  }
+  list.innerHTML = '';
+  filtered.slice(0,200).forEach(t => {
+    const isLikelyTransfer = likelyTransfers.has(t.id);
+    const emoji = t.type === 'transfer' || isLikelyTransfer ? '↔️' : (CAT_EMOJI[t.category] || '📝');
+    const acct = state.accounts.find(a => a.id === t.accountId);
+    let tc = '', tt = '';
+    if(t.type === 'business'){ tc = 'business'; tt = 'BIZ'; }
+    else if(t.type === 'personal'){ tc = 'personal'; tt = 'PERS'; }
+    else if(t.type === 'transfer'){ tc = 'personal'; tt = 'XFER'; }
+    else if(isLikelyTransfer){ tc = 'personal'; tt = '~XFER'; }
+    
+    const item = document.createElement('div'); item.className = 'tx-item'; item.onclick = () => openTxModal(t);
+    const bgColor = t.type === 'transfer' || isLikelyTransfer ? 'rgba(168,170,197,0.1)' : (t.amount > 0 ? 'var(--green-soft)' : 'rgba(212,175,55,0.1)');
+    item.innerHTML = `
+      <div class="tx-cat-dot" style="background:${bgColor}">${emoji}</div>
+      <div class="tx-info">
+        <div class="tx-desc">${t.description}${tt ? `<span class="tx-tag ${tc}">${tt}</span>` : ''}</div>
+        <div class="tx-meta">${formatDate(t.date)} • ${(acct?.displayName || acct?.name) || 'Account'} • ${t.category}</div>
+      </div>
+      <div class="tx-amount ${t.amount > 0 ? 'income' : 'expense'}" style="${t.type === 'transfer' || isLikelyTransfer ? 'color:var(--text-muted);text-decoration:line-through' : ''}">${t.amount > 0 ? '+' : ''}${fmt(t.amount)}</div>`;
+    list.appendChild(item);
+  });
+  
+  if(filtered.length > 200){
+    const more = document.createElement('div');
+    more.style.cssText = 'text-align:center;padding:16px;color:var(--text-muted);font-size:12px';
+    more.textContent = `Showing 200 of ${filtered.length}. Use filters to narrow.`;
+    list.appendChild(more);
+  }
+}
+
+function renderReports(){
+  const now = new Date();
+  const ms = new Date(now.getFullYear(), now.getMonth(), 1);
+  const mt = state.transactions.filter(t => parseLocalDate(t.date) >= ms && t.type !== 'transfer' && !t.excluded);
+  const pi = mt.filter(t => t.amount > 0 && t.type !== 'business').reduce((s,t) => s + t.amount, 0);
+  const pe = mt.filter(t => t.amount < 0 && t.type === 'personal').reduce((s,t) => s + Math.abs(t.amount), 0);
+  const bi = mt.filter(t => t.amount > 0 && t.type === 'business').reduce((s,t) => s + t.amount, 0);
+  const be = mt.filter(t => t.amount < 0 && t.type === 'business').reduce((s,t) => s + Math.abs(t.amount), 0);
+
+  document.getElementById('plBreakdown').innerHTML = `
+    <div class="tx-detail-row"><span class="tx-detail-label">Personal Income</span><span class="tx-detail-value" style="color:var(--green)">${fmt(pi)}</span></div>
+    <div class="tx-detail-row"><span class="tx-detail-label">Personal Expenses</span><span class="tx-detail-value" style="color:var(--red)">${fmt(pe)}</span></div>
+    <div class="tx-detail-row"><span class="tx-detail-label" style="font-weight:600">Personal Net</span><span class="tx-detail-value" style="color:var(--gold);font-weight:600">${fmt(pi - pe)}</span></div>
+    <div style="height:12px"></div>
+    <div class="tx-detail-row"><span class="tx-detail-label">Business Income</span><span class="tx-detail-value" style="color:var(--green)">${fmt(bi)}</span></div>
+    <div class="tx-detail-row"><span class="tx-detail-label">Business Expenses</span><span class="tx-detail-value" style="color:var(--red)">${fmt(be)}</span></div>
+    <div class="tx-detail-row"><span class="tx-detail-label" style="font-weight:600">Business Net</span><span class="tx-detail-value" style="color:var(--gold);font-weight:600">${fmt(bi - be)}</span></div>`;
+
+  const cm = {};
+  mt.filter(t => t.amount < 0 && t.type === 'personal').forEach(t => { cm[t.category] = (cm[t.category] || 0) + Math.abs(t.amount); });
+  const sc = Object.entries(cm).sort((a,b) => b[1] - a[1]).slice(0,5);
+  document.getElementById('topCategories').innerHTML = sc.length === 0
+    ? '<div class="empty-state"><div class="empty-sub">No expenses this month</div></div>'
+    : sc.map(([c, a]) => `<div class="tx-detail-row"><span class="tx-detail-label">${CAT_EMOJI[c] || '📝'} ${c}</span><span class="tx-detail-value">${fmt(a)}</span></div>`).join('');
+}
+
+function renderAIInsight(){
+  if(state.transactions.length === 0) return;
+  const now = new Date();
+  const today = state.transactions.filter(t => { const d = parseLocalDate(t.date); return d && d.toDateString() === now.toDateString(); });
+  const yest = state.transactions.filter(t => { const y = new Date(now); y.setDate(y.getDate() - 1); const d = parseLocalDate(t.date); return d && d.toDateString() === y.toDateString(); });
+  const ts = today.filter(t => t.amount < 0).reduce((s,t) => s + Math.abs(t.amount), 0);
+  const ys = yest.filter(t => t.amount < 0).reduce((s,t) => s + Math.abs(t.amount), 0);
+  let text = '';
+  if(today.length > 0) text = `Today you spent <strong>${fmt(ts)}</strong> across ${today.filter(t => t.amount < 0).length} transactions. `;
+  else if(yest.length > 0) text = `Yesterday you spent <strong>${fmt(ys)}</strong> across ${yest.filter(t => t.amount < 0).length} transactions. `;
+  const unc = state.transactions.filter(t => !t.type || t.type === 'uncategorized').length;
+  if(unc > 0) text += `You have <strong>${unc} transactions</strong> to review. `;
+  const ud = state.accounts.filter(a => a.type === 'credit' && a.dueDate && Math.ceil((new Date(a.dueDate) - new Date()) / 86400000) <= 3);
+  if(ud.length > 0) text += `<strong>${ud.length} card${ud.length > 1 ? 's' : ''}</strong> due within 3 days. `;
+  if(text){ document.getElementById('aiInsightCard').style.display = 'block'; document.getElementById('aiInsightText').innerHTML = text; }
+}
+
+function openTxModal(t){
+  state.currentTx = t;
+  document.getElementById('modalDesc').textContent = t.description;
+  document.getElementById('modalAmount').textContent = (t.amount > 0 ? '+' : '') + fmt(t.amount);
+  document.getElementById('modalAmount').style.color = t.amount > 0 ? 'var(--green)' : 'var(--text-primary)';
+  document.getElementById('modalCategory').value = t.category || 'Other';
+  document.getElementById('modalNotes').value = t.notes || '';
+  document.getElementById('modalAccount').textContent = state.accounts.find(a => a.id === t.accountId)?.name || '—';
+  document.getElementById('modalDate').textContent = formatDate(t.date);
+  // Only target tx modal buttons (not account modal buttons)
+  document.querySelectorAll('#txModal .toggle-btn').forEach(b => b.classList.remove('active'));
+  let ac = 'personal';
+  if(t.type === 'business') ac = 'business';
+  else if(t.type === 'transfer') ac = 'transfer';
+  else if(t.type === 'split') ac = 'split';
+  else if(t.type === 'personal') ac = 'personal';
+  document.querySelector(`#txModal .toggle-btn[data-cat="${ac}"]`)?.classList.add('active');
+  document.getElementById('txModal').classList.add('active');
+}
+
+function closeTxModal(){ document.getElementById('txModal').classList.remove('active'); state.currentTx = null; }
+function setTxCategory(c){ 
+  document.querySelectorAll('#txModal .toggle-btn').forEach(b => b.classList.remove('active')); 
+  document.querySelector(`#txModal .toggle-btn[data-cat="${c}"]`)?.classList.add('active'); 
+  // Auto-set category to Transfer if user selects transfer type
+  if(c === 'transfer'){
+    document.getElementById('modalCategory').value = 'Transfer';
+  }
+}
+
+async function saveTxChanges(){
+  if(!state.currentTx) return;
+  const nt = document.querySelector('#txModal .toggle-btn.active')?.dataset.cat || 'personal';
+  const nc = document.getElementById('modalCategory').value;
+  const nn = document.getElementById('modalNotes').value;
+  state.currentTx.type = nt; state.currentTx.category = nc; state.currentTx.notes = nn;
+  if(!state.isDemo && state.supabase){
+    await state.supabase.from('transactions').update({ tx_type: nt, category: nc, notes: nn }).eq('id', state.currentTx.id);
+  }
+  closeTxModal(); renderAll(); showToast('Saved!');
+}
+
+async function openPlaidLink(){
+  if(state.isDemo){ showToast('Demo mode — set up CONFIG to link real accounts'); return; }
+  if(CONFIG.PLAID_CLIENT_ID.includes('YOUR_')){ showToast('Configure Plaid in CONFIG first'); return; }
+  try{
+    const { data } = await state.supabase.functions.invoke('plaid-link-token', { body:{ user_id: state.user.id } });
+    if(!data?.link_token){ showToast('Could not create link token'); return; }
+    Plaid.create({
+      token: data.link_token,
+      onSuccess: async (public_token, metadata) => {
+        showToast('Linking account...');
+        await state.supabase.functions.invoke('plaid-exchange-token', { body:{ public_token, user_id: state.user.id, metadata } });
+        await loadUserData(); showToast('Account linked!');
+      },
+      onExit: (err) => { if(err) showToast('Link cancelled'); }
+    }).open();
+  }catch(e){ showToast('Plaid error: ' + e.message); }
+}
+
+async function syncTransactions(){
+  if(state.isDemo){ showToast('Demo mode — sync disabled'); return; }
+  showToast('Syncing...');
+  try{ 
+    await state.supabase.functions.invoke('plaid-sync', { body:{ user_id: state.user.id } }); 
+    await loadUserData(true); 
+  }
+  catch(e){ showToast('Sync failed: ' + e.message); }
+}
+
+async function forceRefresh(){
+  if(state.isDemo){ showToast('Demo mode — refresh disabled'); return; }
+  const count = state.accounts.length;
+  // Plaid charges per linked institution (item), not per account
+  const items = new Set(state.accounts.map(a => a.item_id)).size;
+  const estCost = (items * 0.10).toFixed(2);
+  
+  const confirm = window.confirm(
+    `⚡ Force Refresh from banks (real-time)\n\n` +
+    `This requests fresh data from ${items} bank${items > 1 ? 's' : ''} RIGHT NOW.\n` +
+    `Estimated cost: $${estCost} (charged by Plaid)\n\n` +
+    `Regular sync (free) only updates when banks send updates (every 4-24 hrs).\n` +
+    `Force refresh is for "I swiped my card just now, need fresh data".\n\n` +
+    `Proceed?`
+  );
+  if(!confirm) return;
+  
+  showToast('Force refreshing (real-time)...');
+  try {
+    await state.supabase.functions.invoke('plaid-force-refresh', { body:{ user_id: state.user.id } });
+    // Wait a moment for Plaid to process
+    showToast('Refresh requested, syncing in 5s...');
+    setTimeout(async () => {
+      await state.supabase.functions.invoke('plaid-sync', { body:{ user_id: state.user.id } });
+      await loadUserData(true);
+    }, 5000);
+  } catch(e){
+    showToast('Refresh failed: ' + e.message);
+  }
+}
+
+function exportCSV(){
+  const rows = [['Date','Description','Account','Category','Type','Owner','Amount','Notes']];
+  state.transactions.forEach(t => {
+    const a = state.accounts.find(x => x.id === t.accountId);
+    rows.push([t.date, t.description, a?.name || '', t.category, t.type, t.owner, t.amount, t.notes || '']);
+  });
+  const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(',')).join('\n');
+  const blob = new Blob([csv], { type:'text/csv' }), url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = `wealthpulse-${new Date().toISOString().slice(0,10)}.csv`; a.click();
+  showToast('CSV downloaded');
+}
+
+async function sendTestEmail(){
+  if(state.isDemo){ showToast('Demo mode — email disabled'); return; }
+  if(!state.supabase || !state.user){ showToast('Not signed in'); return; }
+  
+  showToast('📧 Generating brief & sending...');
+  try {
+    const { data, error } = await state.supabase.functions.invoke('daily-report', {
+      body: { user_id: state.user.id, test: true }
+    });
+    
+    if(error) throw error;
+    
+    if(data?.success){
+      const txCount = data.stats?.transactions || 0;
+      const dues = (data.stats?.urgentDues || 0) + (data.stats?.upcomingDues || 0);
+      showToast(`✅ Email sent! (${txCount} txns, ${dues} dues)`);
+    } else {
+      showToast('Email failed: ' + (data?.error || 'Unknown error'));
+    }
+  } catch(e){
+    showToast('Email failed: ' + e.message);
+    console.error('Email error:', e);
+  }
+}
+
+function switchView(v){
+  document.querySelectorAll('.view').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById(v).classList.add('active');
+  document.querySelector(`.nav-btn[data-view="${v}"]`).classList.add('active');
+  state.currentView = v; window.scrollTo(0, 0);
+}
+
+function fmt(n){ const s = n < 0 ? '-' : ''; return s + '$' + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits:2, maximumFractionDigits:2 }); }
+// Parse a date that may be in 'YYYY-MM-DD' (date-only) or ISO datetime format
+// into a LOCAL Date object representing that calendar day at local midnight.
+// This avoids the UTC-vs-local timezone trap where '2026-05-14' becomes
+// May 13 at 8 PM EST instead of May 14 midnight.
+function parseLocalDate(d){
+  if(!d) return null;
+  if(d instanceof Date) return d;
+  const s = String(d).trim();
+  // Date-only format like '2026-05-14'
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if(dateOnly){
+    return new Date(parseInt(dateOnly[1]), parseInt(dateOnly[2]) - 1, parseInt(dateOnly[3]));
+  }
+  // Full datetime - let JS parse normally (it handles ISO format with TZ correctly)
+  return new Date(s);
+}
+
+function formatDate(d){
+  const dt = parseLocalDate(d);
+  if(!dt) return '';
+  // Compare calendar days, not 24-hour blocks
+  const now = new Date();
+  const todayMid = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const dtMid = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
+  const diff = Math.round((todayMid - dtMid) / 86400000);
+  if(diff === 0) return 'Today';
+  if(diff === 1) return 'Yesterday';
+  if(diff > 0 && diff < 7) return diff + ' days ago';
+  if(diff < 0) return 'In ' + Math.abs(diff) + ' days';
+  return dt.toLocaleDateString('en-US', { month:'short', day:'numeric' });
+}
+
+// Format a DUE date (typically in the future) - "in 3 days", "Today", "2 days ago" if overdue
+function formatDueDate(d){
+  if(!d) return '';
+  const dt = new Date(d + (d.length === 10 ? 'T00:00:00' : ''));
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  const dueDay = new Date(dt);
+  dueDay.setHours(0,0,0,0);
+  const diffDays = Math.round((dueDay - today) / 86400000);
+  
+  const dateStr = dt.toLocaleDateString('en-US', { month:'short', day:'numeric' });
+  
+  if(diffDays === 0) return `${dateStr} (Today)`;
+  if(diffDays === 1) return `${dateStr} (Tomorrow)`;
+  if(diffDays > 1) return `${dateStr} (in ${diffDays} days)`;
+  if(diffDays === -1) return `${dateStr} (1 day overdue)`;
+  return `${dateStr} (${Math.abs(diffDays)} days overdue)`;
+}
+
+// Format last-updated timestamp for account freshness display
+function formatLastUpdated(ts){
+  if(!ts) return 'Never synced';
+  
+  // Parse Postgres timestamps which come in various formats:
+  //   '2026-05-14 10:00:00'          (no TZ -> treat as UTC)
+  //   '2026-05-14 10:00:00.123456+00' (Postgres common; +00 not standard ISO)
+  //   '2026-05-14T10:00:00.123Z'      (ISO with Z)
+  //   '2026-05-14T10:00:00+00:00'     (ISO with offset)
+  let then;
+  if(typeof ts === 'string'){
+    let s = ts.trim();
+    // Convert space to T for ISO compliance
+    s = s.replace(' ', 'T');
+    // Normalize Postgres-style '+00' or '-05' (without :MM) to '+00:00'
+    s = s.replace(/([+-]\d{2})$/, '$1:00');
+    // If no timezone marker at all, append Z (assume UTC)
+    const hasTimezone = /[Z]|[+-]\d{2}:\d{2}$/.test(s);
+    if(!hasTimezone) s += 'Z';
+    then = new Date(s);
+  } else if(ts instanceof Date) {
+    then = ts;
+  } else {
+    then = new Date(ts);
+  }
+  
+  // If parsing failed, bail gracefully
+  if(!then || isNaN(then.getTime())) return 'Recently synced';
+  
+  const now = new Date();
+  const diffMs = now - then;
+  
+  // Future timestamp (clock skew) - treat as "just now"
+  if(diffMs < 0) return 'Updated just now';
+  
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMs / 3600000);
+  
+  // Use LOCAL calendar-day difference (not UTC blocks) for "today"/"yesterday"
+  const thenDay = new Date(then.getFullYear(), then.getMonth(), then.getDate());
+  const nowDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const dayDiff = Math.round((nowDay - thenDay) / 86400000);
+  
+  if(diffMins < 1) return 'Updated just now';
+  if(diffMins < 60) return `Updated ${diffMins}m ago`;
+  if(dayDiff === 0){
+    // Today: show "Xh ago" if recent, else "today at TIME"
+    if(diffHours < 6) return `Updated ${diffHours}h ago`;
+    return `Updated today at ${then.toLocaleTimeString('en-US', { hour:'numeric', minute:'2-digit' })}`;
+  }
+  if(dayDiff === 1) return 'Updated yesterday';
+  if(dayDiff < 7) return `Updated ${dayDiff}d ago`;
+  return `Updated ${then.toLocaleDateString('en-US', { month:'short', day:'numeric' })}`;
+}
+function showToast(m){ const t = document.getElementById('toast'); t.textContent = m; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 2400); }
+</script>
+</body>
+</html>
