@@ -1105,10 +1105,11 @@ body{font-family:'Inter',sans-serif;background:var(--navy-deep);color:var(--text
     
     <div class="input-group">
       <label class="input-label">Account Type *</label>
-      <select class="input" id="manualType" style="font-size:13px">
+      <select class="input" id="manualType" style="font-size:13px" onchange="onManualTypeChange()">
         <option value="checking">💵 Checking</option>
         <option value="savings">🏦 Savings</option>
         <option value="investment">📈 Investment</option>
+        <option value="real_estate">🏘️ Real Estate (Property)</option>
         <option value="credit">💳 Credit Card</option>
         <option value="heloc">🏡 HELOC</option>
         <option value="mortgage">🏠 Mortgage</option>
@@ -1120,8 +1121,8 @@ body{font-family:'Inter',sans-serif;background:var(--navy-deep);color:var(--text
     </div>
     
     <div class="input-group">
-      <label class="input-label">Current Balance * <span style="font-size:10px;color:var(--text-muted);font-weight:normal">(positive number; loans/credit are auto-marked as liability)</span></label>
-      <input type="number" step="0.01" class="input" id="manualBalance" placeholder="e.g., 25000" style="font-size:13px">
+      <label class="input-label">Current Balance * <span style="font-size:10px;color:var(--text-muted);font-weight:normal">(for property: estimated market value; loans/credit are auto-marked as liability)</span></label>
+      <input type="number" step="0.01" class="input" id="manualBalance" placeholder="e.g., 25000 (loan) or 450000 (property value)" style="font-size:13px">
     </div>
     
     <div class="input-group">
@@ -1130,6 +1131,13 @@ body{font-family:'Inter',sans-serif;background:var(--navy-deep);color:var(--text
         <option value="self">Self</option>
         <option value="wife">Wife</option>
         <option value="business">Business</option>
+      </select>
+    </div>
+    
+    <div class="input-group" id="linkedLoanGroup" style="display:none">
+      <label class="input-label">🔗 Linked Loan / Mortgage <span style="font-size:10px;color:var(--text-muted);font-weight:normal">— for real estate, tag the loan against this property (for net worth calc)</span></label>
+      <select class="input" id="manualLinkedLoan" style="font-size:13px">
+        <option value="">— No linked loan —</option>
       </select>
     </div>
     
@@ -1375,13 +1383,14 @@ const GROUP_CONFIG = {
   checking:     { label:'Checking',        icon:'💵', isAsset:true,  order:1 },
   savings:      { label:'Savings & CDs',   icon:'🏦', isAsset:true,  order:2 },
   investment:   { label:'Investments',     icon:'📈', isAsset:true,  order:3 },
-  credit:       { label:'Credit Cards',    icon:'💳', isAsset:false, order:4 },
-  heloc:        { label:'HELOC',           icon:'🏡', isAsset:false, order:5 },
-  mortgage:     { label:'Mortgage',        icon:'🏠', isAsset:false, order:6 },
-  auto:         { label:'Auto Loans',      icon:'🔄', isAsset:false, order:7 },
-  student_loan: { label:'Student Loans',   icon:'🎓', isAsset:false, order:8 },
-  loan:         { label:'Loans',           icon:'📋', isAsset:false, order:9 },
-  other:        { label:'Other',           icon:'📦', isAsset:true,  order:10 }
+  real_estate:  { label:'Real Estate',     icon:'🏘️', isAsset:true,  order:4 },
+  credit:       { label:'Credit Cards',    icon:'💳', isAsset:false, order:5 },
+  heloc:        { label:'HELOC',           icon:'🏡', isAsset:false, order:6 },
+  mortgage:     { label:'Mortgage',        icon:'🏠', isAsset:false, order:7 },
+  auto:         { label:'Auto Loans',      icon:'🔄', isAsset:false, order:8 },
+  student_loan: { label:'Student Loans',   icon:'🎓', isAsset:false, order:9 },
+  loan:         { label:'Loans',           icon:'📋', isAsset:false, order:10 },
+  other:        { label:'Other',           icon:'📦', isAsset:true,  order:11 }
 };
 
 // Credit card payment URLs by institution
@@ -2229,6 +2238,18 @@ function renderAccounts(){
       const initial = (dispInst || dispName).charAt(0);
       const ob = a.owner === 'wife' ? '<span class="account-owner wife">Wife</span>' : (a.owner === 'business' ? '<span class="account-owner">Business</span>' : '');
       const manualBadge = a.is_manual ? '<span style="font-size:9px;color:var(--gold);background:rgba(212,175,55,0.15);padding:2px 6px;border-radius:4px;margin-left:4px;font-weight:600">MANUAL</span>' : '';
+      // Real estate equity calculation if linked loan present
+      let equityLine = '';
+      if((a.user_type === 'real_estate' || a.subtype === 'real_estate') && a.linked_loan_id){
+        const linkedLoan = state.accounts.find(x => x.id === a.linked_loan_id);
+        if(linkedLoan){
+          const propVal = Math.abs(Number(a.balance || 0));
+          const loanBal = Math.abs(Number(linkedLoan.balance || 0));
+          const equity = propVal - loanBal;
+          const equityColor = equity >= 0 ? 'var(--gold)' : 'var(--red)';
+          equityLine = `<div style="font-size:10px;color:${equityColor};margin-top:2px;font-weight:600">🔗 ${linkedLoan.name}: ${fmt(-loanBal)} • Equity: ${fmt(equity)}</div>`;
+        }
+      }
       const item = document.createElement('div');
       item.className = 'account-item';
       item.style.cursor = 'pointer';
@@ -2244,6 +2265,7 @@ function renderAccounts(){
         <div class="account-info">
           <div class="account-name">${dispName} ${ob}${manualBadge}</div>
           <div class="account-type">${dispInst} • ${a.subtype || a.type}</div>
+          ${equityLine}
           <div style="font-size:9px;color:var(--text-muted);margin-top:2px;opacity:0.7">${updatedText}</div>
         </div>
         <div class="account-balance" style="color:${balColor}">${fmt(balDisplay)}</div>`;
@@ -2280,6 +2302,40 @@ function openManualAccountModalById(accountId){
   }
 }
 
+function onManualTypeChange(){
+  const type = document.getElementById('manualType').value;
+  const linkedLoanGroup = document.getElementById('linkedLoanGroup');
+  if(type === 'real_estate'){
+    linkedLoanGroup.style.display = 'block';
+    populateLinkedLoanDropdown();
+  } else {
+    linkedLoanGroup.style.display = 'none';
+  }
+}
+
+function populateLinkedLoanDropdown(){
+  const select = document.getElementById('manualLinkedLoan');
+  const currentValue = select.value;
+  // Clear and add default
+  select.innerHTML = '<option value="">— No linked loan —</option>';
+  // Find all loan-type accounts (mortgage, heloc, loan, student_loan, auto)
+  const loanSubtypes = ['mortgage', 'heloc', 'loan', 'student_loan', 'auto'];
+  const loans = (state.accounts || []).filter(a => 
+    loanSubtypes.includes(a.user_type || a.subtype) || 
+    a.type === 'loan' ||
+    (a.subtype && a.subtype.includes('mortgage'))
+  );
+  loans.forEach(loan => {
+    const opt = document.createElement('option');
+    opt.value = loan.id;
+    const bal = Math.abs(Number(loan.balance || 0));
+    opt.textContent = `${loan.name} (${loan.institution}) — $${bal.toLocaleString()}`;
+    select.appendChild(opt);
+  });
+  // Restore previous selection if still valid
+  if(currentValue) select.value = currentValue;
+}
+
 function openManualAccountModal(existingAccount = null){
   const modal = document.getElementById('manualAcctModal');
   const title = document.getElementById('manualAcctTitle');
@@ -2299,6 +2355,10 @@ function openManualAccountModal(existingAccount = null){
     document.getElementById('manualMinPay').value = existingAccount.manual_min_payment || existingAccount.min_payment || '';
     document.getElementById('manualPayUrl').value = existingAccount.pay_url || '';
     document.getElementById('manualNotes').value = existingAccount.notes || '';
+    // Populate linked loan dropdown then set value
+    populateLinkedLoanDropdown();
+    document.getElementById('manualLinkedLoan').value = existingAccount.linked_loan_id || '';
+    onManualTypeChange();
     deleteBtn.style.display = 'block';
   } else {
     // Add mode - clear all fields
@@ -2314,6 +2374,9 @@ function openManualAccountModal(existingAccount = null){
     document.getElementById('manualMinPay').value = '';
     document.getElementById('manualPayUrl').value = '';
     document.getElementById('manualNotes').value = '';
+    populateLinkedLoanDropdown();
+    document.getElementById('manualLinkedLoan').value = '';
+    onManualTypeChange();
     deleteBtn.style.display = 'none';
   }
   
@@ -2336,6 +2399,7 @@ async function saveManualAccount(){
   const minPay = document.getElementById('manualMinPay').value ? parseFloat(document.getElementById('manualMinPay').value) : null;
   const payUrl = document.getElementById('manualPayUrl').value.trim() || null;
   const notes = document.getElementById('manualNotes').value.trim() || null;
+  const linkedLoanId = document.getElementById('manualLinkedLoan').value || null;
   
   if(!name || !institution || isNaN(balanceInput)){
     showToast('Name, Institution, and Balance are required');
@@ -2364,7 +2428,7 @@ async function saveManualAccount(){
       user_id: state.user.id,
       name: name,
       institution: institution,
-      type: isLiability ? 'loan' : 'depository',
+      type: isLiability ? 'loan' : (type === 'real_estate' ? 'other' : 'depository'),
       subtype: type,
       user_type: type,
       balance: balance,
@@ -2376,6 +2440,7 @@ async function saveManualAccount(){
       manual_min_payment: minPay,
       pay_url: payUrl,
       notes: notes,
+      linked_loan_id: type === 'real_estate' ? linkedLoanId : null,
       item_id: null  // No Plaid item
     };
     
