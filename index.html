@@ -801,6 +801,7 @@ body{font-family:'Inter',sans-serif;background:var(--navy-deep);color:var(--text
       <div id="setupNotice" class="setup-notice" style="display:none">
         <strong>⚙️ Setup Required:</strong> Edit <code>CONFIG</code> values at top of this file's script section with your Supabase URL, anon key, and Plaid client ID. See HTML comments above for full setup guide.
       </div>
+      <div id="relinkAlertBanner" style="display:none;background:linear-gradient(135deg,rgba(255,107,107,0.15),rgba(255,107,107,0.05));border:1px solid rgba(255,107,107,0.35);border-radius:12px;padding:12px 14px;margin-bottom:14px"></div>
       <div class="networth-card">
         <div class="networth-label">Total Net Worth</div>
         <div class="networth-value" id="netWorthValue">$0</div>
@@ -1658,22 +1659,40 @@ async function loadUserData(forceFresh = false){
       .eq('user_id', state.user.id)
       .order('date', { ascending: false });
     
-    const [{ data: accounts }, { data: txs }] = await Promise.all([accountsQuery, txsQuery]);
+    // Also load plaid_items to know which items need re-linking
+    const itemsQuery = state.supabase
+      .from('plaid_items')
+      .select('id, institution_name, needs_relink, last_sync_error, last_sync_at')
+      .eq('user_id', state.user.id);
     
-    state.accounts = (accounts || []).map(a => ({ 
-      ...a, 
-      // Display name uses custom_name if set, falls back to original
-      displayName: a.custom_name || a.name,
-      displayInstitution: a.custom_institution || a.institution,
-      dueDate: a.manual_due_date || a.due_date,
-      dueAmount: a.manual_due_amount || a.due_amount,
-      minPayment: a.manual_min_payment || a.min_payment,
-      payUrl: a.pay_url,
-      lastPaymentDate: a.last_payment_date,
-      lastPaymentAmount: a.last_payment_amount,
-      lastStatementDate: a.last_statement_date,
-      isManualDueDate: !!a.manual_due_date
-    }));
+    const [{ data: accounts }, { data: txs }, { data: items }] = await Promise.all([accountsQuery, txsQuery, itemsQuery]);
+    
+    // Build item lookup map for quick access
+    const itemMap = {};
+    (items || []).forEach(it => { itemMap[it.id] = it; });
+    state.plaidItems = items || [];
+    
+    state.accounts = (accounts || []).map(a => {
+      const item = a.item_id ? itemMap[a.item_id] : null;
+      return { 
+        ...a, 
+        // Display name uses custom_name if set, falls back to original
+        displayName: a.custom_name || a.name,
+        displayInstitution: a.custom_institution || a.institution,
+        dueDate: a.manual_due_date || a.due_date,
+        dueAmount: a.manual_due_amount || a.due_amount,
+        minPayment: a.manual_min_payment || a.min_payment,
+        payUrl: a.pay_url,
+        lastPaymentDate: a.last_payment_date,
+        lastPaymentAmount: a.last_payment_amount,
+        lastStatementDate: a.last_statement_date,
+        isManualDueDate: !!a.manual_due_date,
+        // Plaid item sync status (for re-link warnings)
+        needsRelink: item ? !!item.needs_relink : false,
+        lastSyncError: item ? item.last_sync_error : null,
+        itemLastSyncAt: item ? item.last_sync_at : null
+      };
+    });
     state.transactions = (txs || []).map(t => ({ 
       id:t.id, date:t.date, amount:Number(t.amount), description:t.description, 
       accountId:t.account_id, category:t.category, type:t.tx_type, owner:t.owner, 
@@ -1757,6 +1776,8 @@ function renderDashboard(){
   
   // Render property-wise net worth breakdown
   renderPropertyNetWorth();
+  // Render re-link alert banner if any items need re-auth
+  renderRelinkBanner();
 
   // Render breakdown card
   renderNetWorthBreakdown(groups, totalAssets, totalLiabilities);
@@ -2210,6 +2231,60 @@ function renderMonthChart(mt){
   });
 }
 
+function renderRelinkBanner(){
+  const banner = document.getElementById('relinkAlertBanner');
+  if(!banner) return;
+  const failingItems = (state.plaidItems || []).filter(it => it.needs_relink);
+  if(failingItems.length === 0){
+    banner.style.display = 'none';
+    return;
+  }
+  banner.style.display = 'block';
+  const names = failingItems.map(it => it.institution_name).join(', ');
+  const itemListHtml = failingItems.map(it => 
+    `<button onclick="reLinkItem('${it.id}','${(it.institution_name||'').replace(/'/g,'\\\'')}')" style="background:rgba(255,107,107,0.2);border:1px solid rgba(255,107,107,0.4);color:#ff9b9b;padding:6px 12px;border-radius:8px;font-size:12px;cursor:pointer;margin:4px 4px 0 0;font-weight:600">🔄 Re-link ${it.institution_name}</button>`
+  ).join('');
+  banner.innerHTML = `
+    <div style="display:flex;align-items:flex-start;gap:10px">
+      <div style="font-size:20px;line-height:1">⚠️</div>
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:700;color:#ff9b9b">${failingItems.length} bank${failingItems.length>1?'s':''} need re-authentication</div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:2px">${names} — login details have changed. Re-link to resume auto-sync.</div>
+        <div style="margin-top:8px">${itemListHtml}</div>
+      </div>
+    </div>`;
+}
+
+async function reLinkItem(itemId, institutionName){
+  if(state.isDemo){ showToast('Demo mode'); return; }
+  if(!itemId){ showToast('No item to re-link'); return; }
+  try{
+    showToast(`Opening Plaid for ${institutionName}...`);
+    const { data } = await state.supabase.functions.invoke('plaid-link-token', { 
+      body:{ user_id: state.user.id, item_id: itemId } 
+    });
+    if(!data?.link_token){ showToast('Could not create re-link token'); return; }
+    Plaid.create({
+      token: data.link_token,
+      onSuccess: async () => {
+        showToast(`${institutionName} re-linked! Syncing...`);
+        // Clear the needs_relink flag immediately
+        await state.supabase.from('plaid_items').update({ 
+          needs_relink: false, 
+          last_sync_error: null 
+        }).eq('id', itemId);
+        // Trigger a sync
+        await state.supabase.functions.invoke('plaid-sync', { body:{ user_id: state.user.id } });
+        await loadUserData(true);
+        renderDashboard();
+        renderAccounts();
+        showToast('Re-link complete!');
+      },
+      onExit: (err) => { if(err) showToast('Re-link cancelled'); }
+    }).open();
+  }catch(e){ showToast('Re-link error: ' + e.message); }
+}
+
 function renderPropertyNetWorth(){
   const card = document.getElementById('propertyNetWorthCard');
   const properties = (state.accounts || []).filter(a => 
@@ -2325,6 +2400,10 @@ function renderAccounts(){
       const initial = (dispInst || dispName).charAt(0);
       const ob = a.owner === 'wife' ? '<span class="account-owner wife">Wife</span>' : (a.owner === 'business' ? '<span class="account-owner">Business</span>' : '');
       const manualBadge = a.is_manual ? '<span style="font-size:9px;color:var(--gold);background:rgba(212,175,55,0.15);padding:2px 6px;border-radius:4px;margin-left:4px;font-weight:600">MANUAL</span>' : '';
+      // Re-link warning badge for Plaid items that need re-authentication
+      const relinkBadge = a.needsRelink 
+        ? `<span style="font-size:9px;color:#ff6b6b;background:rgba(255,107,107,0.15);padding:2px 6px;border-radius:4px;margin-left:4px;font-weight:600;cursor:pointer" onclick="event.stopPropagation();reLinkItem('${a.item_id}','${(a.displayInstitution||a.institution||'').replace(/'/g,'\\\'')}')">⚠ RE-LINK</span>` 
+        : '';
       // Real estate equity calculation if allocations present
       let equityLine = '';
       if((a.user_type === 'real_estate' || a.subtype === 'real_estate')){
@@ -2360,7 +2439,7 @@ function renderAccounts(){
       item.innerHTML = `
         <div class="account-icon">${initial}</div>
         <div class="account-info">
-          <div class="account-name">${dispName} ${ob}${manualBadge}</div>
+          <div class="account-name">${dispName} ${ob}${manualBadge}${relinkBadge}</div>
           <div class="account-type">${dispInst} • ${a.subtype || a.type}</div>
           ${equityLine}
           <div style="font-size:9px;color:var(--text-muted);margin-top:2px;opacity:0.7">${updatedText}</div>
