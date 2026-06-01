@@ -946,11 +946,11 @@ body{font-family:'Inter',sans-serif;background:var(--navy-deep);color:var(--text
       <div id="forecastSummary"></div>
       <div id="forecastTimeline" style="margin-top:8px"></div>
       <div class="month-card" style="margin-top:16px">
-        <div class="section-header"><div class="section-title">🔁 Detected Recurring Patterns</div><div class="section-meta">From last 90 days</div></div>
+        <div class="section-header"><div class="section-title">🔁 Detected Recurring Patterns</div><div class="section-meta">Stable bills & income</div></div>
         <div id="recurringPatterns"></div>
       </div>
       <div style="font-size:10px;color:var(--text-muted);text-align:center;margin-top:12px;line-height:1.5;padding:0 12px">
-        💡 Predictions use pattern detection on your past transactions (frequency + amount + merchant). They're estimates, not guarantees. New or irregular expenses won't appear.
+        💡 Only TRUE recurring items are shown — bills/income that appear in 3+ of the last 4 months, with a stable amount (±25%) and on roughly the same date each month. Variable spending like groceries, restaurants, and Zelle/Venmo transfers is intentionally excluded.
       </div>
     </div>
     <div id="reportsView" class="view">
@@ -3605,146 +3605,195 @@ async function sendTestEmail(){
 // ============ RECURRING DETECTION & FORECAST ENGINE ============
 // Analyzes past transactions to find recurring patterns, then projects next 7 days.
 
+// ============ STRICT RECURRING DETECTION & FORECAST ENGINE ============
+// Philosophy: only predict transactions that behave like real bills/income —
+// present in MOST recent months, with a STABLE amount and a TIGHT day-of-month
+// window. Everything variable (groceries, restaurants, Zelle/Venmo, shopping)
+// is intentionally excluded.
+
 function normalizeMerchant(desc){
   if(!desc) return '';
   let s = String(desc).toLowerCase();
-  // Strip common noise: trailing numbers, dates, store ids, card tails
   s = s.replace(/\b\d{1,2}\/\d{1,2}(\/\d{2,4})?\b/g, ' ');     // dates
   s = s.replace(/#?\d{3,}/g, ' ');                              // long numbers / store ids
   s = s.replace(/\bx{2,}\d+\b/g, ' ');                          // card tails like xx1234
-  s = s.replace(/\b(pos|ach|debit|credit|payment|purchase|recurring|autopay|web|id|ppd|ccd)\b/g, ' ');
-  s = s.replace(/[^a-z ]/g, ' ');                              // keep letters only
+  s = s.replace(/\b(pos|ach|debit|credit|payment|purchase|recurring|autopay|web|id|ppd|ccd|des|indn|co)\b/g, ' ');
+  s = s.replace(/[^a-z ]/g, ' ');                              // letters only
   s = s.replace(/\s+/g, ' ').trim();
-  // Take first 3 meaningful tokens as the merchant key
-  return s.split(' ').filter(w => w.length > 2).slice(0, 3).join(' ');
+  // first 2 meaningful tokens = merchant key (keeps "washington gas", "baselane rent")
+  return s.split(' ').filter(w => w.length > 2).slice(0, 2).join(' ');
 }
 
+function mean(arr){ return arr.length ? arr.reduce((s,x)=>s+x,0)/arr.length : 0; }
+function stddev(arr){
+  if(arr.length < 2) return 0;
+  const m = mean(arr);
+  return Math.sqrt(arr.reduce((s,x)=>s+Math.pow(x-m,2),0) / arr.length);
+}
 function median(arr){
   if(!arr.length) return 0;
-  const s = [...arr].sort((a,b) => a-b);
+  const s = [...arr].sort((a,b)=>a-b);
   const m = Math.floor(s.length/2);
   return s.length % 2 ? s[m] : (s[m-1]+s[m])/2;
 }
+// circular day-of-month average + spread (handles month-end wrap like 30,31,1,2)
+function dayStats(days){
+  // map day-of-month (1..31) to angle on a 31-day circle
+  const ang = days.map(d => (d-1) / 31 * 2 * Math.PI);
+  const sx = mean(ang.map(Math.cos)), sy = mean(ang.map(Math.sin));
+  const R = Math.sqrt(sx*sx + sy*sy);            // 1 = perfectly clustered, 0 = scattered
+  let meanAng = Math.atan2(sy, sx);
+  if(meanAng < 0) meanAng += 2*Math.PI;
+  const meanDay = Math.round(meanAng / (2*Math.PI) * 31) + 1;
+  // circular stddev in "days" units: sqrt(-2 ln R) * (31/2pi)
+  const circStd = R > 0 ? Math.sqrt(-2 * Math.log(Math.min(1,Math.max(1e-9,R)))) * (31/(2*Math.PI)) : 31;
+  return { meanDay: ((meanDay-1)%31)+1, spread: circStd, clustering: R };
+}
 
-// Detect recurring groups from transactions in the last `lookbackDays` days
-function detectRecurring(lookbackDays = 90){
+// Detect TRUE recurring items over the last `months` calendar months.
+function detectRecurring(months = 4){
   const now = new Date();
-  const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate() - lookbackDays);
-  
-  // Group by normalized merchant + sign (income vs expense)
+  const startMonth = new Date(now.getFullYear(), now.getMonth() - (months-1), 1);
+  // number of distinct calendar months in the window that actually exist in data range
+  const monthsInWindow = months;
+
+  // group by merchant + direction
   const groups = {};
   (state.transactions || []).forEach(t => {
     if(t.excluded) return;
     const d = parseLocalDate(t.date);
-    if(!d || d < cutoff) return;
-    const key = normalizeMerchant(t.description) + '|' + (t.amount >= 0 ? 'in' : 'out');
-    if(!key || key.startsWith('|')) return;
-    if(!groups[key]) groups[key] = [];
-    groups[key].push({ date: d, amount: Number(t.amount), desc: t.description, accountId: t.accountId });
-  });
-  
-  const recurring = [];
-  Object.entries(groups).forEach(([key, txns]) => {
-    if(txns.length < 2) return; // need at least 2 occurrences
-    // Sort by date
-    txns.sort((a,b) => a.date - b.date);
-    // Compute gaps between consecutive occurrences (in days)
-    const gaps = [];
-    for(let i=1; i<txns.length; i++){
-      gaps.push(Math.round((txns[i].date - txns[i-1].date) / 86400000));
-    }
-    const medGap = median(gaps);
-    if(medGap < 5) return; // too frequent / noise (e.g. daily coffee not predictable enough)
-    if(medGap > 45) return; // longer than monthly-ish, skip (low confidence)
-    
-    // Determine cadence label
-    let cadence = 'monthly', period = 30;
-    if(medGap <= 9){ cadence = 'weekly'; period = 7; }
-    else if(medGap <= 18){ cadence = 'biweekly'; period = 14; }
-    else { cadence = 'monthly'; period = 30; }
-    
-    // Consistency: how regular are the gaps? (lower deviation = higher confidence)
-    const gapDeviation = gaps.length > 1 
-      ? Math.sqrt(gaps.reduce((s,g) => s + Math.pow(g - medGap, 2), 0) / gaps.length)
-      : period * 0.3;
-    const consistency = Math.max(0, 1 - (gapDeviation / period));
-    
-    // Confidence: more occurrences + more consistent = higher
-    const occurrenceScore = Math.min(1, txns.length / 4);
-    const confidence = Math.round((consistency * 0.6 + occurrenceScore * 0.4) * 100);
-    if(confidence < 40) return; // skip low-confidence noise
-    
-    const amounts = txns.map(t => Math.abs(t.amount));
-    const typicalAmount = median(amounts);
-    const lastTxn = txns[txns.length - 1];
-    const nextDate = new Date(lastTxn.date.getFullYear(), lastTxn.date.getMonth(), lastTxn.date.getDate() + period);
-    
-    recurring.push({
-      key,
-      label: lastTxn.desc,
-      merchant: normalizeMerchant(lastTxn.desc),
-      isIncome: txns[0].amount >= 0,
-      typicalAmount,
-      cadence,
-      period,
-      confidence,
-      occurrences: txns.length,
-      lastDate: lastTxn.date,
-      nextDate,
-      accountId: lastTxn.accountId
+    if(!d || d < startMonth) return;
+    const mkey = normalizeMerchant(t.description);
+    if(!mkey || mkey.length < 3) return;
+    const key = mkey + '|' + (t.amount >= 0 ? 'in' : 'out');
+    (groups[key] = groups[key] || []).push({
+      date: d,
+      ym: d.getFullYear()*12 + d.getMonth(),
+      dom: d.getDate(),
+      amount: Math.abs(Number(t.amount)),
+      signed: Number(t.amount),
+      desc: t.description,
+      accountId: t.accountId
     });
   });
-  
-  // Sort by confidence desc
+
+  const recurring = [];
+  Object.entries(groups).forEach(([key, txns]) => {
+    // ---- RULE 1: must appear in most recent months (>=3 distinct months) ----
+    const monthsPresent = new Set(txns.map(t => t.ym)).size;
+    if(monthsPresent < 3) return;
+
+    // collapse to ONE representative per month (sum same-merchant hits in a month,
+    // but for bills there's usually just one; use the median amount per month)
+    const byMonth = {};
+    txns.forEach(t => { (byMonth[t.ym] = byMonth[t.ym] || []).push(t); });
+    const monthlyAmounts = Object.values(byMonth).map(arr => median(arr.map(x=>x.amount)));
+    const allAmounts = txns.map(t => t.amount);
+    const allDays = txns.map(t => t.dom);
+
+    // ---- RULE 2: amount must be stable (coefficient of variation <= 0.25) ----
+    const avgAmt = mean(monthlyAmounts);
+    const amtCV = avgAmt > 0 ? stddev(monthlyAmounts) / avgAmt : 1;
+    if(amtCV > 0.25) return;            // variable amount -> not a bill (kills groceries, P2P)
+    if(avgAmt < 1) return;              // ignore sub-$1 noise (interest pennies)
+
+    // ---- RULE 3: day-of-month must be tightly clustered (<= 3 days spread) ----
+    const ds = dayStats(allDays);
+    if(ds.spread > 3.0) return;         // scattered across the month -> not scheduled
+
+    // ---- RULE 4: avg occurrences per active month ~1 (not many-times-a-month) ----
+    const perMonth = txns.length / monthsPresent;
+    if(perMonth > 1.6) return;          // shows up many times a month -> not a single bill
+
+    // ---- Confidence: combine month coverage, amount stability, day clustering ----
+    const monthScore = Math.min(1, monthsPresent / monthsInWindow);  // 3/4=.75, 4/4=1
+    const amtScore = Math.max(0, 1 - amtCV / 0.25);                  // tighter = higher
+    const dayScore = Math.max(0, 1 - ds.spread / 3.0);              // tighter = higher
+    const confidence = Math.round((monthScore*0.4 + amtScore*0.3 + dayScore*0.3) * 100);
+    if(confidence < 60) return;        // strict floor
+
+    const last = txns.slice().sort((a,b)=>a.date-b.date)[txns.length-1];
+    const isIncome = txns[0].signed >= 0;
+    const typicalAmount = median(monthlyAmounts);
+
+    // next occurrence: the clustered meanDay in the next month relative to last occurrence
+    const targetDom = ds.meanDay;
+    let ny = last.date.getFullYear(), nm = last.date.getMonth() + 1;
+    if(nm > 11){ nm = 0; ny++; }
+    // clamp day to month length
+    const dim = new Date(ny, nm+1, 0).getDate();
+    const nextDate = new Date(ny, nm, Math.min(targetDom, dim));
+
+    recurring.push({
+      key, label: last.desc, merchant: normalizeMerchant(last.desc),
+      isIncome, typicalAmount,
+      cadence: 'monthly',
+      targetDom,
+      daySpread: Math.round(ds.spread*10)/10,
+      amtCV: Math.round(amtCV*100)/100,
+      confidence,
+      monthsPresent,
+      occurrences: txns.length,
+      lastDate: last.date,
+      nextDate,
+      accountId: last.accountId
+    });
+  });
+
   recurring.sort((a,b) => b.confidence - a.confidence);
   return recurring;
 }
 
-// Project recurring items into the next `days` days
+// Project monthly recurring items into the next `days` days.
 function forecastNextDays(days = 7){
-  const recurring = detectRecurring(90);
+  const recurring = detectRecurring(4);
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const horizon = new Date(today.getFullYear(), today.getMonth(), today.getDate() + days);
-  
+
   const predicted = [];
   recurring.forEach(r => {
-    // Project forward from nextDate; may hit multiple times for weekly within window
-    let d = new Date(r.nextDate);
-    // If nextDate already passed (overdue), roll forward to next future occurrence
-    while(d < today){
-      d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + r.period);
-    }
-    while(d <= horizon){
-      predicted.push({
-        date: new Date(d),
-        label: r.label,
-        merchant: r.merchant,
-        amount: r.isIncome ? r.typicalAmount : -r.typicalAmount,
-        isIncome: r.isIncome,
-        confidence: r.confidence,
-        cadence: r.cadence,
-        accountId: r.accountId
-      });
-      d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + r.period);
+    // candidate dates: this month's targetDom and next month's targetDom
+    for(let mOff=0; mOff<=1; mOff++){
+      const y = today.getFullYear();
+      const m = today.getMonth() + mOff;
+      const dim = new Date(y, m+1, 0).getDate();
+      const d = new Date(y, m, Math.min(r.targetDom, dim));
+      if(d >= today && d <= horizon){
+        // avoid duplicate if already seen this month (already paid)
+        const already = (state.transactions||[]).some(t => {
+          if(t.excluded) return false;
+          const td = parseLocalDate(t.date);
+          if(!td) return false;
+          return normalizeMerchant(t.description) === r.merchant &&
+                 td.getFullYear()===d.getFullYear() && td.getMonth()===d.getMonth();
+        });
+        if(already) continue;
+        predicted.push({
+          date: new Date(d),
+          label: r.label,
+          merchant: r.merchant,
+          amount: r.isIncome ? r.typicalAmount : -r.typicalAmount,
+          isIncome: r.isIncome,
+          confidence: r.confidence,
+          accountId: r.accountId
+        });
+      }
     }
   });
-  
   predicted.sort((a,b) => a.date - b.date);
   return predicted;
 }
 
 function renderPredictions(){
-  const recurring = detectRecurring(90);
+  const recurring = detectRecurring(4);
   const predicted = forecastNextDays(7);
-  
-  // Summary cards
+
   const totalIn = predicted.filter(p => p.isIncome).reduce((s,p) => s + p.amount, 0);
   const totalOut = predicted.filter(p => !p.isIncome).reduce((s,p) => s + Math.abs(p.amount), 0);
   const net = totalIn - totalOut;
-  
-  const summary = document.getElementById('forecastSummary');
-  summary.innerHTML = `
+
+  document.getElementById('forecastSummary').innerHTML = `
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px">
       <div style="background:rgba(46,204,113,0.1);border:1px solid rgba(46,204,113,0.25);border-radius:12px;padding:12px;text-align:center">
         <div style="font-size:10px;color:var(--text-muted);letter-spacing:0.5px">EXPECTED IN</div>
@@ -3759,27 +3808,24 @@ function renderPredictions(){
         <div style="font-size:16px;font-weight:700;color:${net>=0?'var(--gold)':'#ff6b6b'};font-family:'Fraunces',Georgia,serif;margin-top:4px">${fmt(net)}</div>
       </div>
     </div>`;
-  
-  // Timeline grouped by date
+
   const timeline = document.getElementById('forecastTimeline');
   if(predicted.length === 0){
     timeline.innerHTML = `<div class="month-card" style="text-align:center;padding:30px 16px;color:var(--text-muted)">
-      <div style="font-size:32px;margin-bottom:8px">🔮</div>
-      <div style="font-size:14px;font-weight:600;color:var(--text-secondary)">No recurring patterns predicted in next 7 days</div>
-      <div style="font-size:12px;margin-top:6px">Need at least 2 months of transaction history with repeating merchants. Keep syncing and check back.</div>
+      <div style="font-size:32px;margin-bottom:8px">📅</div>
+      <div style="font-size:14px;font-weight:600;color:var(--text-secondary)">No recurring bills/income expected in the next 7 days</div>
+      <div style="font-size:12px;margin-top:6px">Only true recurring items (stable amount, same date each month) are forecast. Scroll down to see all detected patterns and when they're next due.</div>
     </div>`;
     document.getElementById('recurringPatterns').innerHTML = renderRecurringList(recurring);
     return;
   }
-  
-  // Group predicted by day
+
   const byDay = {};
   predicted.forEach(p => {
     const k = p.date.toISOString().slice(0,10);
-    if(!byDay[k]) byDay[k] = [];
-    byDay[k].push(p);
+    (byDay[k] = byDay[k] || []).push(p);
   });
-  
+
   let html = '';
   Object.entries(byDay).forEach(([dayKey, items]) => {
     const d = parseLocalDate(dayKey);
@@ -3794,11 +3840,11 @@ function renderPredictions(){
     items.forEach(p => {
       const acct = state.accounts.find(a => a.id === p.accountId);
       const acctName = acct ? (acct.displayName || acct.name) : '';
-      const confColor = p.confidence >= 70 ? '#2ecc71' : p.confidence >= 55 ? 'var(--gold)' : '#ff9b6b';
+      const confColor = p.confidence >= 80 ? '#2ecc71' : p.confidence >= 70 ? 'var(--gold)' : '#ff9b6b';
       html += `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-top:1px solid var(--border-soft)">
         <div style="flex:1;min-width:0">
           <div style="font-size:13px;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${p.isIncome?'⬆️':'⬇️'} ${p.label}</div>
-          <div style="font-size:10px;color:var(--text-muted);margin-top:1px">${acctName ? acctName+' · ' : ''}${p.cadence} · <span style="color:${confColor}">${p.confidence}% likely</span></div>
+          <div style="font-size:10px;color:var(--text-muted);margin-top:1px">${acctName ? acctName+' · ' : ''}monthly · <span style="color:${confColor}">${p.confidence}% likely</span></div>
         </div>
         <div style="font-size:14px;font-weight:600;color:${p.isIncome?'#2ecc71':'var(--text-primary)'};margin-left:8px">${fmt(p.amount)}</div>
       </div>`;
@@ -3806,23 +3852,23 @@ function renderPredictions(){
     html += `</div>`;
   });
   timeline.innerHTML = html;
-  
   document.getElementById('recurringPatterns').innerHTML = renderRecurringList(recurring);
 }
 
 function renderRecurringList(recurring){
   if(!recurring.length){
-    return `<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:16px">No recurring patterns detected yet. Need repeating transactions over 2+ months.</div>`;
+    return `<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:16px">No stable recurring patterns found yet. Need 3+ months of bills/income with consistent amounts and dates.</div>`;
   }
-  return recurring.slice(0, 20).map(r => {
+  return recurring.slice(0, 25).map(r => {
     const acct = state.accounts.find(a => a.id === r.accountId);
     const acctName = acct ? (acct.displayName || acct.name) : '';
-    const confColor = r.confidence >= 70 ? '#2ecc71' : r.confidence >= 55 ? 'var(--gold)' : '#ff9b6b';
+    const confColor = r.confidence >= 80 ? '#2ecc71' : r.confidence >= 70 ? 'var(--gold)' : '#ff9b6b';
     const nextLabel = formatDate(r.nextDate.toISOString().slice(0,10));
+    const ord = (n)=>{ const s=['th','st','nd','rd'],v=n%100; return n+(s[(v-20)%10]||s[v]||s[0]); };
     return `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border-soft)">
       <div style="flex:1;min-width:0">
         <div style="font-size:13px;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${r.isIncome?'⬆️':'⬇️'} ${r.label}</div>
-        <div style="font-size:10px;color:var(--text-muted);margin-top:1px">${acctName ? acctName+' · ' : ''}${r.cadence} · ${r.occurrences}× seen · next ~${nextLabel} · <span style="color:${confColor}">${r.confidence}%</span></div>
+        <div style="font-size:10px;color:var(--text-muted);margin-top:1px">${acctName ? acctName+' · ' : ''}~${ord(r.targetDom)} of month · ${r.monthsPresent}mo · next ${nextLabel} · <span style="color:${confColor}">${r.confidence}%</span></div>
       </div>
       <div style="font-size:13px;font-weight:600;color:${r.isIncome?'#2ecc71':'var(--text-primary)'};margin-left:8px">${fmt(r.isIncome?r.typicalAmount:-r.typicalAmount)}</div>
     </div>`;
