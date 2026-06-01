@@ -938,6 +938,21 @@ body{font-family:'Inter',sans-serif;background:var(--navy-deep);color:var(--text
       </div>
     </div>
 
+    <div id="predictionsView" class="view">
+      <div style="margin-bottom:16px">
+        <div style="font-size:22px;font-weight:700;font-family:'Fraunces',Georgia,serif;color:var(--text-primary)">📊 7-Day Forecast</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-top:4px">Predicted recurring income & expenses based on your transaction history across all accounts</div>
+      </div>
+      <div id="forecastSummary"></div>
+      <div id="forecastTimeline" style="margin-top:8px"></div>
+      <div class="month-card" style="margin-top:16px">
+        <div class="section-header"><div class="section-title">🔁 Detected Recurring Patterns</div><div class="section-meta">From last 90 days</div></div>
+        <div id="recurringPatterns"></div>
+      </div>
+      <div style="font-size:10px;color:var(--text-muted);text-align:center;margin-top:12px;line-height:1.5;padding:0 12px">
+        💡 Predictions use pattern detection on your past transactions (frequency + amount + merchant). They're estimates, not guarantees. New or irregular expenses won't appear.
+      </div>
+    </div>
     <div id="reportsView" class="view">
       <div class="month-card">
         <div class="section-header"><div class="section-title">P&L Breakdown</div><div class="section-meta">Personal vs Business</div></div>
@@ -982,6 +997,10 @@ body{font-family:'Inter',sans-serif;background:var(--navy-deep);color:var(--text
     <button class="nav-btn" data-view="transactionsView">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
       ACTIVITY
+    </button>
+    <button class="nav-btn" data-view="predictionsView">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4"/><path d="M12 18v4"/><path d="M4.93 4.93l2.83 2.83"/><path d="M16.24 16.24l2.83 2.83"/><circle cx="12" cy="12" r="4"/></svg>
+      FORECAST
     </button>
     <button class="nav-btn" data-view="reportsView">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
@@ -3504,7 +3523,7 @@ async function forceRefresh(){
   if(state.isDemo){ showToast('Demo mode — refresh disabled'); return; }
   const count = state.accounts.length;
   // Plaid charges per linked institution (item), not per account
-  const items = new Set(state.accounts.map(a => a.item_id)).size;
+  const items = new Set(state.accounts.filter(a => a.item_id).map(a => a.item_id)).size;
   const estCost = (items * 0.10).toFixed(2);
   
   const confirm = window.confirm(
@@ -3517,17 +3536,32 @@ async function forceRefresh(){
   );
   if(!confirm) return;
   
-  showToast('Force refreshing (real-time)...');
+  showToast('⚡ Force refreshing from banks...');
   try {
-    await state.supabase.functions.invoke('plaid-force-refresh', { body:{ user_id: state.user.id } });
-    // Wait a moment for Plaid to process
-    showToast('Refresh requested, syncing in 5s...');
-    setTimeout(async () => {
-      await state.supabase.functions.invoke('plaid-sync', { body:{ user_id: state.user.id } });
-      await loadUserData(true);
-    }, 5000);
+    // Step 1: request real-time refresh from Plaid
+    const { error: frErr } = await state.supabase.functions.invoke('plaid-force-refresh', { body:{ user_id: state.user.id } });
+    if(frErr) throw new Error(frErr.message || 'force-refresh failed');
+    
+    // Step 2: wait for Plaid to fetch, then sync (poll up to 3 times)
+    showToast('Banks processing... syncing balances');
+    await new Promise(r => setTimeout(r, 6000));
+    
+    const { data: syncData, error: syncErr } = await state.supabase.functions.invoke('plaid-sync', { body:{ user_id: state.user.id } });
+    if(syncErr) throw new Error(syncErr.message || 'sync failed');
+    
+    // Step 3: reload UI
+    await loadUserData(true);
+    renderDashboard();
+    renderAccounts();
+    
+    // Surface per-bank result
+    if(syncData && syncData.items_failed > 0){
+      showToast(`Synced ${syncData.items_synced} banks · ${syncData.items_failed} need re-link`);
+    } else {
+      showToast(`✅ All ${syncData?.items_synced || ''} banks refreshed`);
+    }
   } catch(e){
-    showToast('Refresh failed: ' + e.message);
+    showToast('Refresh failed: ' + (e.message || e));
   }
 }
 
@@ -3568,12 +3602,240 @@ async function sendTestEmail(){
   }
 }
 
+// ============ RECURRING DETECTION & FORECAST ENGINE ============
+// Analyzes past transactions to find recurring patterns, then projects next 7 days.
+
+function normalizeMerchant(desc){
+  if(!desc) return '';
+  let s = String(desc).toLowerCase();
+  // Strip common noise: trailing numbers, dates, store ids, card tails
+  s = s.replace(/\b\d{1,2}\/\d{1,2}(\/\d{2,4})?\b/g, ' ');     // dates
+  s = s.replace(/#?\d{3,}/g, ' ');                              // long numbers / store ids
+  s = s.replace(/\bx{2,}\d+\b/g, ' ');                          // card tails like xx1234
+  s = s.replace(/\b(pos|ach|debit|credit|payment|purchase|recurring|autopay|web|id|ppd|ccd)\b/g, ' ');
+  s = s.replace(/[^a-z ]/g, ' ');                              // keep letters only
+  s = s.replace(/\s+/g, ' ').trim();
+  // Take first 3 meaningful tokens as the merchant key
+  return s.split(' ').filter(w => w.length > 2).slice(0, 3).join(' ');
+}
+
+function median(arr){
+  if(!arr.length) return 0;
+  const s = [...arr].sort((a,b) => a-b);
+  const m = Math.floor(s.length/2);
+  return s.length % 2 ? s[m] : (s[m-1]+s[m])/2;
+}
+
+// Detect recurring groups from transactions in the last `lookbackDays` days
+function detectRecurring(lookbackDays = 90){
+  const now = new Date();
+  const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate() - lookbackDays);
+  
+  // Group by normalized merchant + sign (income vs expense)
+  const groups = {};
+  (state.transactions || []).forEach(t => {
+    if(t.excluded) return;
+    const d = parseLocalDate(t.date);
+    if(!d || d < cutoff) return;
+    const key = normalizeMerchant(t.description) + '|' + (t.amount >= 0 ? 'in' : 'out');
+    if(!key || key.startsWith('|')) return;
+    if(!groups[key]) groups[key] = [];
+    groups[key].push({ date: d, amount: Number(t.amount), desc: t.description, accountId: t.accountId });
+  });
+  
+  const recurring = [];
+  Object.entries(groups).forEach(([key, txns]) => {
+    if(txns.length < 2) return; // need at least 2 occurrences
+    // Sort by date
+    txns.sort((a,b) => a.date - b.date);
+    // Compute gaps between consecutive occurrences (in days)
+    const gaps = [];
+    for(let i=1; i<txns.length; i++){
+      gaps.push(Math.round((txns[i].date - txns[i-1].date) / 86400000));
+    }
+    const medGap = median(gaps);
+    if(medGap < 5) return; // too frequent / noise (e.g. daily coffee not predictable enough)
+    if(medGap > 45) return; // longer than monthly-ish, skip (low confidence)
+    
+    // Determine cadence label
+    let cadence = 'monthly', period = 30;
+    if(medGap <= 9){ cadence = 'weekly'; period = 7; }
+    else if(medGap <= 18){ cadence = 'biweekly'; period = 14; }
+    else { cadence = 'monthly'; period = 30; }
+    
+    // Consistency: how regular are the gaps? (lower deviation = higher confidence)
+    const gapDeviation = gaps.length > 1 
+      ? Math.sqrt(gaps.reduce((s,g) => s + Math.pow(g - medGap, 2), 0) / gaps.length)
+      : period * 0.3;
+    const consistency = Math.max(0, 1 - (gapDeviation / period));
+    
+    // Confidence: more occurrences + more consistent = higher
+    const occurrenceScore = Math.min(1, txns.length / 4);
+    const confidence = Math.round((consistency * 0.6 + occurrenceScore * 0.4) * 100);
+    if(confidence < 40) return; // skip low-confidence noise
+    
+    const amounts = txns.map(t => Math.abs(t.amount));
+    const typicalAmount = median(amounts);
+    const lastTxn = txns[txns.length - 1];
+    const nextDate = new Date(lastTxn.date.getFullYear(), lastTxn.date.getMonth(), lastTxn.date.getDate() + period);
+    
+    recurring.push({
+      key,
+      label: lastTxn.desc,
+      merchant: normalizeMerchant(lastTxn.desc),
+      isIncome: txns[0].amount >= 0,
+      typicalAmount,
+      cadence,
+      period,
+      confidence,
+      occurrences: txns.length,
+      lastDate: lastTxn.date,
+      nextDate,
+      accountId: lastTxn.accountId
+    });
+  });
+  
+  // Sort by confidence desc
+  recurring.sort((a,b) => b.confidence - a.confidence);
+  return recurring;
+}
+
+// Project recurring items into the next `days` days
+function forecastNextDays(days = 7){
+  const recurring = detectRecurring(90);
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const horizon = new Date(today.getFullYear(), today.getMonth(), today.getDate() + days);
+  
+  const predicted = [];
+  recurring.forEach(r => {
+    // Project forward from nextDate; may hit multiple times for weekly within window
+    let d = new Date(r.nextDate);
+    // If nextDate already passed (overdue), roll forward to next future occurrence
+    while(d < today){
+      d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + r.period);
+    }
+    while(d <= horizon){
+      predicted.push({
+        date: new Date(d),
+        label: r.label,
+        merchant: r.merchant,
+        amount: r.isIncome ? r.typicalAmount : -r.typicalAmount,
+        isIncome: r.isIncome,
+        confidence: r.confidence,
+        cadence: r.cadence,
+        accountId: r.accountId
+      });
+      d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + r.period);
+    }
+  });
+  
+  predicted.sort((a,b) => a.date - b.date);
+  return predicted;
+}
+
+function renderPredictions(){
+  const recurring = detectRecurring(90);
+  const predicted = forecastNextDays(7);
+  
+  // Summary cards
+  const totalIn = predicted.filter(p => p.isIncome).reduce((s,p) => s + p.amount, 0);
+  const totalOut = predicted.filter(p => !p.isIncome).reduce((s,p) => s + Math.abs(p.amount), 0);
+  const net = totalIn - totalOut;
+  
+  const summary = document.getElementById('forecastSummary');
+  summary.innerHTML = `
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px">
+      <div style="background:rgba(46,204,113,0.1);border:1px solid rgba(46,204,113,0.25);border-radius:12px;padding:12px;text-align:center">
+        <div style="font-size:10px;color:var(--text-muted);letter-spacing:0.5px">EXPECTED IN</div>
+        <div style="font-size:16px;font-weight:700;color:#2ecc71;font-family:'Fraunces',Georgia,serif;margin-top:4px">${fmt(totalIn)}</div>
+      </div>
+      <div style="background:rgba(255,107,107,0.1);border:1px solid rgba(255,107,107,0.25);border-radius:12px;padding:12px;text-align:center">
+        <div style="font-size:10px;color:var(--text-muted);letter-spacing:0.5px">EXPECTED OUT</div>
+        <div style="font-size:16px;font-weight:700;color:#ff6b6b;font-family:'Fraunces',Georgia,serif;margin-top:4px">${fmt(totalOut)}</div>
+      </div>
+      <div style="background:rgba(212,175,55,0.1);border:1px solid rgba(212,175,55,0.25);border-radius:12px;padding:12px;text-align:center">
+        <div style="font-size:10px;color:var(--text-muted);letter-spacing:0.5px">NET 7-DAY</div>
+        <div style="font-size:16px;font-weight:700;color:${net>=0?'var(--gold)':'#ff6b6b'};font-family:'Fraunces',Georgia,serif;margin-top:4px">${fmt(net)}</div>
+      </div>
+    </div>`;
+  
+  // Timeline grouped by date
+  const timeline = document.getElementById('forecastTimeline');
+  if(predicted.length === 0){
+    timeline.innerHTML = `<div class="month-card" style="text-align:center;padding:30px 16px;color:var(--text-muted)">
+      <div style="font-size:32px;margin-bottom:8px">🔮</div>
+      <div style="font-size:14px;font-weight:600;color:var(--text-secondary)">No recurring patterns predicted in next 7 days</div>
+      <div style="font-size:12px;margin-top:6px">Need at least 2 months of transaction history with repeating merchants. Keep syncing and check back.</div>
+    </div>`;
+    document.getElementById('recurringPatterns').innerHTML = renderRecurringList(recurring);
+    return;
+  }
+  
+  // Group predicted by day
+  const byDay = {};
+  predicted.forEach(p => {
+    const k = p.date.toISOString().slice(0,10);
+    if(!byDay[k]) byDay[k] = [];
+    byDay[k].push(p);
+  });
+  
+  let html = '';
+  Object.entries(byDay).forEach(([dayKey, items]) => {
+    const d = parseLocalDate(dayKey);
+    const dayLabel = formatDate(dayKey);
+    const dow = d.toLocaleDateString('en-US', { weekday:'short' });
+    const dayNet = items.reduce((s,p) => s + p.amount, 0);
+    html += `<div class="month-card" style="padding:12px 14px;margin-bottom:8px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div style="font-size:13px;font-weight:700;color:var(--text-primary)">${dayLabel} <span style="color:var(--text-muted);font-weight:400">· ${dow}</span></div>
+        <div style="font-size:13px;font-weight:700;color:${dayNet>=0?'#2ecc71':'#ff6b6b'}">${fmt(dayNet)}</div>
+      </div>`;
+    items.forEach(p => {
+      const acct = state.accounts.find(a => a.id === p.accountId);
+      const acctName = acct ? (acct.displayName || acct.name) : '';
+      const confColor = p.confidence >= 70 ? '#2ecc71' : p.confidence >= 55 ? 'var(--gold)' : '#ff9b6b';
+      html += `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-top:1px solid var(--border-soft)">
+        <div style="flex:1;min-width:0">
+          <div style="font-size:13px;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${p.isIncome?'⬆️':'⬇️'} ${p.label}</div>
+          <div style="font-size:10px;color:var(--text-muted);margin-top:1px">${acctName ? acctName+' · ' : ''}${p.cadence} · <span style="color:${confColor}">${p.confidence}% likely</span></div>
+        </div>
+        <div style="font-size:14px;font-weight:600;color:${p.isIncome?'#2ecc71':'var(--text-primary)'};margin-left:8px">${fmt(p.amount)}</div>
+      </div>`;
+    });
+    html += `</div>`;
+  });
+  timeline.innerHTML = html;
+  
+  document.getElementById('recurringPatterns').innerHTML = renderRecurringList(recurring);
+}
+
+function renderRecurringList(recurring){
+  if(!recurring.length){
+    return `<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:16px">No recurring patterns detected yet. Need repeating transactions over 2+ months.</div>`;
+  }
+  return recurring.slice(0, 20).map(r => {
+    const acct = state.accounts.find(a => a.id === r.accountId);
+    const acctName = acct ? (acct.displayName || acct.name) : '';
+    const confColor = r.confidence >= 70 ? '#2ecc71' : r.confidence >= 55 ? 'var(--gold)' : '#ff9b6b';
+    const nextLabel = formatDate(r.nextDate.toISOString().slice(0,10));
+    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border-soft)">
+      <div style="flex:1;min-width:0">
+        <div style="font-size:13px;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${r.isIncome?'⬆️':'⬇️'} ${r.label}</div>
+        <div style="font-size:10px;color:var(--text-muted);margin-top:1px">${acctName ? acctName+' · ' : ''}${r.cadence} · ${r.occurrences}× seen · next ~${nextLabel} · <span style="color:${confColor}">${r.confidence}%</span></div>
+      </div>
+      <div style="font-size:13px;font-weight:600;color:${r.isIncome?'#2ecc71':'var(--text-primary)'};margin-left:8px">${fmt(r.isIncome?r.typicalAmount:-r.typicalAmount)}</div>
+    </div>`;
+  }).join('');
+}
+
 function switchView(v){
   document.querySelectorAll('.view').forEach(x => x.classList.remove('active'));
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
   document.getElementById(v).classList.add('active');
   document.querySelector(`.nav-btn[data-view="${v}"]`).classList.add('active');
   state.currentView = v; window.scrollTo(0, 0);
+  if(v === 'predictionsView') renderPredictions();
 }
 
 function fmt(n){ const s = n < 0 ? '-' : ''; return s + '$' + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits:2, maximumFractionDigits:2 }); }
